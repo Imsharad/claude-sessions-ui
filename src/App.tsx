@@ -12,6 +12,7 @@ import { Sidebar } from "./components/Sidebar";
 import { SessionList } from "./components/SessionList";
 import { SessionDetail } from "./components/SessionDetail";
 import { FirstRun } from "./components/FirstRun";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import {
   indexStatus,
   listSessions,
@@ -100,43 +101,45 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full flex-col">
-      <TopBar
-        view={view}
-        onViewChange={setView}
-        status={status}
-        stats={stats}
-        reindexing={reindexing}
-        onReindex={handleReindex}
-      />
+    <ErrorBoundary>
+      <div className="flex h-full flex-col">
+        <TopBar
+          view={view}
+          onViewChange={setView}
+          status={status}
+          stats={stats}
+          reindexing={reindexing}
+          onReindex={handleReindex}
+        />
 
-      {view === "launcher" && (
-        <div className="flex min-h-0 flex-1">
-          <Sidebar
-            sessions={sessions}
-            selectedProject={selectedProject}
-            onSelectProject={(dir) => {
-              setSelectedProject(dir);
-              setSelectedSession(null);
-            }}
-            query={query}
-            onQueryChange={setQuery}
-            onPinnedChange={refresh}
-          />
-          <SessionList
-            sessions={visibleSessions}
-            selectedId={selectedSession}
-            onSelect={setSelectedSession}
-          />
-          <div className="flex w-[420px] shrink-0 flex-col border-l border-border">
-            <SessionDetail sessionId={selectedSession} />
+        {view === "launcher" && (
+          <div className="flex min-h-0 flex-1">
+            <Sidebar
+              sessions={sessions}
+              selectedProject={selectedProject}
+              onSelectProject={(dir) => {
+                setSelectedProject(dir);
+                setSelectedSession(null);
+              }}
+              query={query}
+              onQueryChange={setQuery}
+              onPinnedChange={refresh}
+            />
+            <SessionList
+              sessions={visibleSessions}
+              selectedId={selectedSession}
+              onSelect={setSelectedSession}
+            />
+            <div className="flex w-[420px] shrink-0 flex-col border-l border-border">
+              <SessionDetail sessionId={selectedSession} />
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {view === "analytics" && <ComingSoon title="Analytics" />}
-      {view === "digest" && <ComingSoon title="Digest" />}
-    </div>
+        {view === "analytics" && <ComingSoon title="Analytics" />}
+        {view === "digest" && <ComingSoon title="Digest" />}
+      </div>
+    </ErrorBoundary>
   );
 }
 

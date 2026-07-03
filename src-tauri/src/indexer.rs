@@ -458,8 +458,10 @@ fn parse_and_upsert(
     let file_size = raw.len() as i64;
 
     // Per-session wall duration: last_ts - first_ts (ms). Best-effort parse.
+    // Clamp at 0 — sub-ms timestamp jitter can otherwise yield -1ms, and a
+    // negative duration has no meaningful interpretation in the UI.
     let duration_ms = match (&first_ts, &last_ts) {
-        (Some(a), Some(b)) => iso_diff_ms(a, b).unwrap_or(0),
+        (Some(a), Some(b)) => iso_diff_ms(a, b).unwrap_or(0).max(0),
         _ => 0,
     };
 

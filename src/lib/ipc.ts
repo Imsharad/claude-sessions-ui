@@ -1,9 +1,31 @@
 /**
- * Type-safe IPC bindings. Mirror the Rust types in src-tauri/src/lib.rs exactly —
- * serde camelCases on the wire (Tauri default), so Rust `project_dir` becomes
- * `projectDir` here. If you add a command in Rust, add it here too.
+ * Type-safe IPC bindings. Mirror the Rust types in src-tauri/src/lib.rs exactly.
+ * Rust structs carry #[serde(rename_all = "camelCase")] so field names match
+ * (project_dir on the Rust side ↔ projectDir here). If you add a command in
+ * Rust, add it here too.
  */
 import { invoke } from "@tauri-apps/api/core";
+
+/**
+ * Debug wrapper around invoke — logs every call + result/error to the webview
+ * console so IPC issues are visible in devtools (⌥⌘I in the running app).
+ * No-op in production builds.
+ */
+const DEBUG = import.meta.env.DEV;
+async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const t0 = DEBUG ? performance.now() : 0;
+  try {
+    const result = await invoke<T>(cmd, args);
+    if (DEBUG) {
+      const ms = (performance.now() - t0).toFixed(1);
+      console.log(`%c[${cmd}]%c ${ms}ms`, "color:#4c7bf5;font-weight:bold", "color:#8a857c", args ?? "");
+    }
+    return result;
+  } catch (e) {
+    console.error(`%c[${cmd}] FAILED`, "color:#d6483a;font-weight:bold", args ?? "", e);
+    throw e;
+  }
+}
 
 export interface ScanStats {
   filesSeen: number;
@@ -132,37 +154,38 @@ export interface PricingRow {
 }
 
 // ─── Command wrappers ──────────────────────────────────────────────────
-// Each mirrors a #[tauri::command] in lib.rs. invoke() camelCases the arg names.
+// Each mirrors a #[tauri::command] in lib.rs. Args are passed as-is; Rust
+// deserializes with the same camelCase convention.
 
 export const reindex = (forceFull = false): Promise<ScanStats> =>
-  invoke<ScanStats>("reindex", { forceFull });
+  call<ScanStats>("reindex", { forceFull });
 
 export const indexStatus = (): Promise<IndexStatus> =>
-  invoke<IndexStatus>("index_status");
+  call<IndexStatus>("index_status");
 
 export const listSessions = (filter?: SessionFilter): Promise<SessionCard[]> =>
-  invoke<SessionCard[]>("list_sessions", { filter: filter ?? null });
+  call<SessionCard[]>("list_sessions", { filter: filter ?? null });
 
 export const getSessionDetail = (id: string): Promise<SessionDetail> =>
-  invoke<SessionDetail>("get_session_detail", { id });
+  call<SessionDetail>("get_session_detail", { id });
 
 export const searchRecaps = (query: string): Promise<RecapHit[]> =>
-  invoke<RecapHit[]>("search_recaps", { query });
+  call<RecapHit[]>("search_recaps", { query });
 
 export const digest = (days = 30): Promise<DigestDay[]> =>
-  invoke<DigestDay[]>("digest", { days });
+  call<DigestDay[]>("digest", { days });
 
 export const getStats = (): Promise<GlobalStats> =>
-  invoke<GlobalStats>("get_stats");
+  call<GlobalStats>("get_stats");
 
 export const resumeSession = (id: string, fork = false): Promise<void> =>
-  invoke<void>("resume_session", { id, fork });
+  call<void>("resume_session", { id, fork });
 
 export const togglePin = (encodedDir: string): Promise<void> =>
-  invoke<void>("toggle_pin", { encodedDir });
+  call<void>("toggle_pin", { encodedDir });
 
 export const getPricing = (): Promise<PricingRow[]> =>
-  invoke<PricingRow[]>("get_pricing");
+  call<PricingRow[]>("get_pricing");
 
 export const setPricing = (rows: PricingRow[]): Promise<void> =>
-  invoke<void>("set_pricing", { rows });
+  call<void>("set_pricing", { rows });

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 // ─── IPC types ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ScanStats {
     pub files_seen: usize,
     pub files_reindexed: usize,
@@ -47,6 +48,7 @@ impl From<indexer::ScanStats> for ScanStats {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionCard {
     pub id: String,
     pub project_dir: String,
@@ -70,6 +72,7 @@ pub struct SessionCard {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionFilter {
     pub project_dir: Option<String>,
     pub query: Option<String>, // matches title or recap
@@ -78,6 +81,7 @@ pub struct SessionFilter {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Recap {
     pub uuid: String,
     pub captured_ts: Option<String>,
@@ -87,6 +91,7 @@ pub struct Recap {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Todo {
     pub seq: i64,
     pub content: String,
@@ -94,6 +99,7 @@ pub struct Todo {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelUsage {
     pub model: String,
     pub input_toks: i64,
@@ -105,6 +111,7 @@ pub struct ModelUsage {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionDetail {
     pub card: SessionCard,
     pub recaps: Vec<Recap>,
@@ -116,6 +123,7 @@ pub struct SessionDetail {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct RecapHit {
     pub session_id: String,
     pub title: String,
@@ -125,12 +133,14 @@ pub struct RecapHit {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct DigestDay {
     pub day: String, // YYYY-MM-DD
     pub sessions: Vec<DigestEntry>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct DigestEntry {
     pub session_id: String,
     pub title: String,
@@ -142,6 +152,7 @@ pub struct DigestEntry {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct GlobalStats {
     pub total_sessions: i64,
     pub total_messages: i64,
@@ -158,6 +169,7 @@ pub struct GlobalStats {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct IndexStatus {
     pub last_scan_ts: Option<String>,
     pub last_scan_mode: Option<String>,
@@ -166,6 +178,7 @@ pub struct IndexStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct PricingRow {
     pub model: String,
     pub input_per_mtok: f64,
@@ -664,4 +677,39 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    #[test]
+    fn session_card_serializes_camel_case() {
+        let c = SessionCard {
+            id: "x".into(),
+            project_dir: "p".into(),
+            cwd: "/".into(),
+            display_project: "d".into(),
+            git_branch: None,
+            title: "t".into(),
+            first_ts: None,
+            last_ts: None,
+            message_count: 5,
+            duration_ms: 1000,
+            plan_mode: false,
+            has_recap: true,
+            recap: None,
+            input_toks: 1,
+            output_toks: 2,
+            cache_read_toks: 3,
+            cost_usd: 0.0,
+            cost_source: "none".into(),
+            pinned: false,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"projectDir\""), "expected camelCase projectDir, got: {}", json);
+        assert!(json.contains("\"messageCount\""));
+        assert!(json.contains("\"cacheReadToks\""));
+        assert!(!json.contains("project_dir"), "snake_case leaked: {}", json);
+    }
 }

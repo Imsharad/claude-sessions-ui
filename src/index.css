@@ -21,10 +21,12 @@
   --color-ink-3: #8e857a;          /* tertiary / metadata */
   --color-ink-4: #b4ab9f;          /* faint / placeholders */
 
-  /* Single accent: soft, calm blue — desaturated so it doesn't read harsh */
-  --color-accent: #5b7ccc;         /* softer than pure blue */
-  --color-accent-soft: #e8eef9;
-  --color-accent-strong: #4565b8;
+  /* Single accent: soft, calm indigo-leaning blue — reads quiet on warm cream,
+     never "tech-blue." Hue shifted toward violet (~229°) so it harmonizes with
+     the paper canvas instead of clashing with it. */
+  --color-accent: #5d72c4;
+  --color-accent-soft: #edeff8;
+  --color-accent-strong: #4759a5;
 
   /* Semantic */
   --color-positive: #4a9670;

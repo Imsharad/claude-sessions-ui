@@ -12,9 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "claude-sessions-ui",
-        "width": 800,
-        "height": 600
+        "title": "Claude Sessions",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 600,
+        "decorations": true,
+        "transparent": false
       }
     ],
     "security": {

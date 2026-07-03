@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+/* ─── Claude Sessions UI — design tokens ───────────────────────────────
+ * Light-mode, warm, creamy. The aesthetic the plan calls for: warm white
+ * surfaces, soft blue accent, layered shadows, no hard edges, SF typography.
+ * Tailwind v4 CSS-first theme — these become utilities like bg-surface.
+ * ────────────────────────────────────────────────────────────────────── */
+@theme {
+  /* Warm whites — the "creamy" part. Not stark gray. */
+  --color-canvas: #faf9f7;        /* app background — warm paper */
+  --color-surface: #ffffff;        /* cards, panes */
+  --color-surface-2: #f4f2ee;      /* hover, secondary surfaces */
+  --color-surface-3: #ebe8e2;      /* active, borders-strong */
+
+  --color-border: #e6e2db;         /* hairline dividers */
+  --color-border-strong: #d8d3ca;
+
+  /* Ink scale — warm grays, not blue-grays */
+  --color-ink: #1f1d1a;            /* primary text */
+  --color-ink-2: #4a463f;          /* secondary text */
+  --color-ink-3: #8a857c;          /* tertiary / metadata */
+  --color-ink-4: #b8b3a9;          /* faint / placeholders */
+
+  /* Single accent: soft, calm blue */
+  --color-accent: #4c7bf5;
+  --color-accent-soft: #e8efff;
+  --color-accent-strong: #3a64e0;
+
+  /* Semantic */
+  --color-positive: #2f9e6f;
+  --color-positive-soft: #e3f3ec;
+  --color-warn: #c9851a;
+  --color-warn-soft: #faf0db;
+  --color-danger: #d6483a;
+  --color-danger-soft: #fbe7e4;
+
+  /* Type — system SF stack, mono for code/IDs */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro",
+    "Helvetica Neue", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas,
+    monospace;
+
+  /* Radii — soft, no hard edges */
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+
+  /* Soft layered shadows — the depth cue, never harsh */
+  --shadow-xs: 0 1px 2px rgba(60, 50, 30, 0.04);
+  --shadow-sm: 0 1px 3px rgba(60, 50, 30, 0.06), 0 1px 2px rgba(60, 50, 30, 0.04);
+  --shadow-md: 0 4px 12px rgba(60, 50, 30, 0.07), 0 1px 3px rgba(60, 50, 30, 0.04);
+  --shadow-lg: 0 12px 32px rgba(60, 50, 30, 0.1), 0 2px 8px rgba(60, 50, 30, 0.05);
+
+  /* Motion — spring-feel easings (Framer handles the physics; these are for CSS) */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ─── Base ───────────────────────────────────────────────────────────── */
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Native Mac feel — let the window chrome breathe */
+  font-feature-settings: "ss01", "cv11";
+}
+
+/* Custom scrollbar — thin, warm, unobtrusive (Mac-native feel) */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-4);
+  background-clip: content-box;
+}
+
+/* Selection — soft accent */
+::selection {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-strong);
+}
+
+/* Focus ring — visible but soft */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}

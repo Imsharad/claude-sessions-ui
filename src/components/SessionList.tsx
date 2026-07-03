@@ -105,8 +105,10 @@ interface CardProps {
 }
 
 function SessionCardView({ session: s, selected, onClick }: CardProps) {
-  // Recap-led: the recap (or first prompt) is the headline.
-  const headline = s.recap ? truncate(s.recap, 180) : truncate(s.title || "(untitled)", 120);
+  // Recap-led: the recap (or title fallback) is the headline — the hero.
+  // Title becomes a quieter subtitle only when a recap leads.
+  const hasRecap = Boolean(s.recap);
+  const headline = hasRecap ? truncate(s.recap!, 180) : truncate(s.title || "(untitled)", 120);
   return (
     <motion.div
       layout
@@ -115,75 +117,84 @@ function SessionCardView({ session: s, selected, onClick }: CardProps) {
       transition={{ type: "spring", stiffness: 400, damping: 30 }}
       className={`group mb-2 cursor-pointer rounded-xl border p-3.5 transition ${
         selected
-          ? "border-accent/40 bg-accent-soft/60 shadow-sm"
+          ? "border-accent/40 bg-accent-soft/70 shadow-sm"
           : "border-border bg-surface hover:border-border-strong hover:shadow-sm"
       }`}
     >
-      {/* Headline: recap or title */}
+      {/* Hero: the recap (or title fallback). Sharper weight when recap-led. */}
       <div className="flex items-start gap-2">
-        {s.recap && (
+        {hasRecap && (
           <Sparkles
             size={13}
-            className="mt-0.5 shrink-0 text-accent"
+            className="mt-[3px] shrink-0 text-accent"
             aria-label="has recap"
           />
         )}
         <p
-          className={`flex-1 text-[13px] leading-snug ${
-            s.recap ? "text-ink" : "text-ink-2 italic"
+          className={`flex-1 leading-snug ${
+            hasRecap
+              ? "text-[13.5px] font-medium text-ink"           // recap = hero, darker + slightly larger
+              : "text-[13px] text-ink-2"                        // title fallback = quieter
           }`}
         >
           {headline}
         </p>
         <ChevronRight
           size={15}
-          className={`mt-0.5 shrink-0 transition ${
+          className={`mt-[3px] shrink-0 transition ${
             selected ? "text-accent" : "text-ink-4 group-hover:text-ink-3"
           }`}
         />
       </div>
 
-      {/* Title (secondary, only if recap is the headline) */}
-      {s.recap && s.title && (
-        <div className="mt-1 truncate pl-[21px] text-[12px] font-medium text-ink-2">
+      {/* Subtitle: the session title — only when a recap leads, and quieter. */}
+      {hasRecap && s.title && s.title !== "(untitled session)" && (
+        <div className="mt-0.5 truncate pl-[21px] text-[11.5px] text-ink-3">
           {s.title}
         </div>
       )}
 
-      {/* Meta row */}
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 pl-[21px] text-[11px] text-ink-3">
-        <span className="font-medium text-ink-2">{s.displayProject}</span>
-        {s.gitBranch && (
-          <span className="inline-flex items-center gap-1 font-mono">
-            <GitBranch size={10} />
-            {s.gitBranch}
+      {/* Meta row — grouped: (project · branch) | (time · msgs · dur) | (cost · tokens)
+          Separated by middle-dots so the eye groups, not runs-on. */}
+      <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 pl-[21px] text-[11px] text-ink-3">
+        <Group>
+          <span className="font-medium text-ink-2">{s.displayProject}</span>
+          {s.gitBranch && (
+            <span className="inline-flex items-center gap-0.5 font-mono text-ink-3">
+              <GitBranch size={10} />
+              {s.gitBranch}
+            </span>
+          )}
+        </Group>
+        <Sep />
+        <Group>
+          <span className="inline-flex items-center gap-0.5">
+            <Clock size={10} />
+            {relativeTime(s.lastTs)}
           </span>
-        )}
-        <span className="inline-flex items-center gap-1">
-          <Clock size={10} />
-          {relativeTime(s.lastTs)}
-        </span>
-        <span className="inline-flex items-center gap-1 tabular-nums">
-          <MessageSquare size={10} />
-          {s.messageCount}
-        </span>
-        {s.durationMs > 0 && (
-          <span className="tabular-nums">{formatDuration(s.durationMs)}</span>
-        )}
-        {s.costUsd > 0.05 && (
-          <span className="ml-auto rounded-full bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-ink-2">
-            {formatCost(s.costUsd)}
+          <span className="inline-flex items-center gap-0.5 tabular-nums">
+            <MessageSquare size={10} />
+            {s.messageCount}
           </span>
-        )}
-        {s.inputToks > 0 && (
-          <span className="font-mono text-[10px] tabular-nums text-ink-4">
-            {formatTokens(s.inputToks + s.outputToks)} tok
-          </span>
-        )}
+          {s.durationMs > 0 && <span className="tabular-nums">{formatDuration(s.durationMs)}</span>}
+        </Group>
+        {(s.costUsd > 0.05 || s.inputToks > 0) && <Sep />}
+        <Group className="ml-auto">
+          {s.costUsd > 0.05 && (
+            <span className="rounded-full bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-ink-2">
+              {formatCost(s.costUsd)}
+            </span>
+          )}
+          {s.inputToks > 0 && (
+            <span className="font-mono text-[10px] tabular-nums text-ink-4">
+              {formatTokens(s.inputToks + s.outputToks)}
+            </span>
+          )}
+        </Group>
       </div>
 
-      {/* Plan-mode + error badges */}
-      {(s.planMode || false) && (
+      {/* Plan-mode badge */}
+      {s.planMode && (
         <div className="mt-1.5 pl-[21px]">
           <span className="rounded-full bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent-strong">
             plan mode
@@ -192,4 +203,14 @@ function SessionCardView({ session: s, selected, onClick }: CardProps) {
       )}
     </motion.div>
   );
+}
+
+/** Visually group a set of meta items (no separator between them). */
+function Group({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+  return <span className={`inline-flex items-center gap-1.5 ${className}`}>{children}</span>;
+}
+
+/** Middle-dot separator between groups. */
+function Sep() {
+  return <span className="text-ink-4">·</span>;
 }

@@ -331,15 +331,41 @@ function Section({
 
 function EmptyState() {
   return (
-    <div className="flex h-full flex-1 items-center justify-center bg-surface">
-      <div className="max-w-xs text-center">
-        <Sparkles size={28} className="mx-auto mb-3 text-ink-4" />
-        <p className="text-[13px] font-medium text-ink-2">Select a session</p>
-        <p className="mt-1 text-[12px] text-ink-3">
-          Pick a session from the list to see its recap, todos, usage, and
-          files — then resume it in Terminal.
+    <div className="flex h-full flex-1 items-center justify-center bg-surface px-6">
+      <div className="w-full max-w-xs">
+        <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-2xl bg-accent-soft">
+          <Sparkles size={20} className="text-accent" />
+        </div>
+        <p className="text-[15px] font-semibold text-ink">Select a session</p>
+        <p className="mt-1 text-[12.5px] leading-relaxed text-ink-3">
+          Click any session to read its recap, todos, and usage — then resume
+          it in Terminal.
         </p>
+        <div className="mt-4 space-y-1.5 border-t border-border pt-4 text-[11px] text-ink-3">
+          <Hint keys={["↑", "↓"]} label="Navigate sessions" />
+          <Hint keys={["⏎"]} label="Open in detail" />
+          <Hint keys={["⌘", "K"]} label="Search (coming)" />
+          <Hint keys={["⌘", "⏎"]} label="Resume in Terminal (coming)" />
+        </div>
       </div>
+    </div>
+  );
+}
+
+function Hint({ keys, label }: { keys: string[]; label: string }) {
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-ink-3">{label}</span>
+      <span className="flex gap-1">
+        {keys.map((k) => (
+          <kbd
+            key={k}
+            className="rounded-md border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-ink-2 shadow-xs"
+          >
+            {k}
+          </kbd>
+        ))}
+      </span>
     </div>
   );
 }

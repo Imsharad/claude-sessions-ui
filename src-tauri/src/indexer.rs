@@ -449,10 +449,12 @@ fn parse_and_upsert(
     };
 
     // Resolve title priority: aiTitle > lastPrompt > first user msg.
-    let resolved_title = title
-        .clone()
-        .or(last_prompt.clone())
-        .or(first_user_msg.clone())
+    // Sanitize each candidate so prompt-content garbage (XML tags, markdown,
+    // file refs) never leaks as the display title. Empty after cleaning → skip.
+    let candidates = [title.as_deref(), last_prompt.as_deref(), first_user_msg.as_deref()];
+    let resolved_title = candidates
+        .iter()
+        .find_map(|c| c.and_then(sanitize_title).filter(|s| s.chars().count() >= 3))
         .unwrap_or_default();
     let resolved_cwd = cwd.unwrap_or(project_cwd.clone());
     let file_size = raw.len() as i64;
@@ -723,6 +725,45 @@ fn truncate_str(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect::<String>() + "…"
+    }
+}
+
+/// Clean a candidate title so prompt-content garbage doesn't leak as the
+/// display title. Mirrors the frontend sanitizeTitle logic so both stay
+/// consistent. Returns None if nothing usable remains.
+///
+///   "<instructions><references>"  →  "instructions references"
+///   "## Task: do X"               →  "Task: do X"
+fn sanitize_title(raw: &str) -> Option<String> {
+    let mut s = raw.trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    // Strip XML/HTML tags, keep inner text.
+    while let (Some(start), _) = (s.find('<'), s.find('>')) {
+        if let Some(end) = s.find('>') {
+            if end > start {
+                s.replace_range(start..=end, " ");
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    // Strip markdown headers / emphasis.
+    let stripped = s.trim_start_matches('#').trim_start();
+    let stripped = stripped.replace(['*', '_', '`'], "");
+    s = stripped;
+    // Collapse whitespace.
+    s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Drop leading @ / / file-ref noise.
+    s = s.trim_start_matches(|c: char| c == '@' || c == '/' || c == '\\').to_string();
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 

@@ -104,13 +104,14 @@ export function Sidebar({
       </div>
 
       <nav className="flex-1 overflow-y-auto px-2 pb-4">
-        {/* All sessions */}
+        {/* All sessions — styled like a project item, not a chunky pill */}
         <ProjectItem
           active={selectedProject === null}
           onClick={() => onSelectProject(null)}
           icon={<Hash size={14} />}
           label="All sessions"
           count={sessions.length}
+          countStyle="muted"
         />
 
         {/* Pinned */}
@@ -176,6 +177,7 @@ interface ProjectItemProps {
   label: string;
   sublabel?: string;
   count?: number;
+  countStyle?: "default" | "muted";
   pinned?: boolean;
   onPin?: () => void;
 }
@@ -187,6 +189,7 @@ function ProjectItem({
   label,
   sublabel,
   count,
+  countStyle = "default",
   pinned,
   onPin,
 }: ProjectItemProps) {
@@ -210,9 +213,14 @@ function ProjectItem({
       </div>
       {count !== undefined && (
         <span
-          className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium tabular-nums ${
-            active ? "bg-accent/15 text-accent-strong" : "bg-surface-3 text-ink-3"
-          }`}
+          className={
+            countStyle === "muted"
+              ? "text-[11px] tabular-nums text-ink-4"                    // muted: bare number, no pill
+              : "rounded-full px-1.5 py-0.5 text-[10px] font-medium tabular-nums " +
+                (active
+                  ? "bg-accent/15 text-accent-strong"
+                  : "bg-surface-3 text-ink-3")
+          }
         >
           {count}
         </span>

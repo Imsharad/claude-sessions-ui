@@ -100,3 +100,45 @@ export function prettyStatus(status: string): string {
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
     .join(" ");
 }
+
+/**
+ * Clean a session title for display. aiTitle is usually clean, but first-prompt
+ * fallbacks can leak raw prompt content: XML tags, markdown headers, file
+ * references. Produce something a human would recognize as a title.
+ *
+ *   "<instructions><references><file>@criteria"  →  "instructions references"
+ *   "## Task: do X"                              →  "Task: do X"
+ *   "Fix the bug\n\nMore text"                   →  "Fix the bug"
+ */
+export function sanitizeTitle(raw: string): string {
+  if (!raw) return "";
+  let s = raw.trim();
+  // Strip XML/HTML tags but keep their inner text (so <instructions> → instructions).
+  s = s.replace(/<[^>]+>/g, " ");
+  // Strip markdown headers / emphasis markers.
+  s = s.replace(/^#{1,6}\s*/, "").replace(/[*_`]/g, "");
+  // Collapse whitespace and newlines to single spaces.
+  s = s.replace(/\s+/g, " ").trim();
+  // Drop leading file-reference / slash-command noise.
+  s = s.replace(/^[@/\\]+\S*\s*/, "").trim();
+  // If it's now empty or too short, leave it (caller falls back).
+  return s;
+}
+
+/**
+ * Resolve the best display title for a session, with graceful fallback.
+ * Priority: clean aiTitle → clean lastPrompt → clean firstUserMsg → "(untitled)".
+ * Never returns prompt-content garbage.
+ */
+export function resolveTitle(opts: {
+  title?: string | null;
+  lastPrompt?: string | null;
+  firstUserMsg?: string | null;
+}): string {
+  for (const candidate of [opts.title, opts.lastPrompt, opts.firstUserMsg]) {
+    if (!candidate) continue;
+    const clean = sanitizeTitle(candidate);
+    if (clean.length >= 3) return truncate(clean, 120);
+  }
+  return "(untitled session)";
+}

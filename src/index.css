@@ -6,33 +6,33 @@
  * Tailwind v4 CSS-first theme — these become utilities like bg-surface.
  * ────────────────────────────────────────────────────────────────────── */
 @theme {
-  /* Warm whites — the "creamy" part. Not stark gray. */
-  --color-canvas: #faf9f7;        /* app background — warm paper */
-  --color-surface: #ffffff;        /* cards, panes */
-  --color-surface-2: #f4f2ee;      /* hover, secondary surfaces */
-  --color-surface-3: #ebe8e2;      /* active, borders-strong */
+  /* Warm whites — pushed genuinely warm. Reads as paper, not gray. */
+  --color-canvas: #f5f1ea;        /* app background — warm paper, more saturation */
+  --color-surface: #fffdf8;        /* cards, panes — warm cream-white, not pure */
+  --color-surface-2: #efe9df;      /* hover, secondary surfaces */
+  --color-surface-3: #e4dcd0;      /* active, borders-strong */
 
-  --color-border: #e6e2db;         /* hairline dividers */
-  --color-border-strong: #d8d3ca;
+  --color-border: #ddd5c7;         /* hairline dividers — warm */
+  --color-border-strong: #cbc1b1;
 
-  /* Ink scale — warm grays, not blue-grays */
-  --color-ink: #1f1d1a;            /* primary text */
-  --color-ink-2: #4a463f;          /* secondary text */
-  --color-ink-3: #8a857c;          /* tertiary / metadata */
-  --color-ink-4: #b8b3a9;          /* faint / placeholders */
+  /* Ink scale — warm dark grays with a brown undertone, never blue-gray */
+  --color-ink: #2a2520;            /* primary text — warm near-black */
+  --color-ink-2: #564f47;          /* secondary text */
+  --color-ink-3: #8e857a;          /* tertiary / metadata */
+  --color-ink-4: #b4ab9f;          /* faint / placeholders */
 
-  /* Single accent: soft, calm blue */
-  --color-accent: #4c7bf5;
-  --color-accent-soft: #e8efff;
-  --color-accent-strong: #3a64e0;
+  /* Single accent: soft, calm blue — desaturated so it doesn't read harsh */
+  --color-accent: #5b7ccc;         /* softer than pure blue */
+  --color-accent-soft: #e8eef9;
+  --color-accent-strong: #4565b8;
 
   /* Semantic */
-  --color-positive: #2f9e6f;
-  --color-positive-soft: #e3f3ec;
-  --color-warn: #c9851a;
-  --color-warn-soft: #faf0db;
-  --color-danger: #d6483a;
-  --color-danger-soft: #fbe7e4;
+  --color-positive: #4a9670;
+  --color-positive-soft: #e3f0e8;
+  --color-warn: #b8821f;
+  --color-warn-soft: #f5ead3;
+  --color-danger: #c25a4c;
+  --color-danger-soft: #f7e4e0;
 
   /* Type — system SF stack, mono for code/IDs */
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro",

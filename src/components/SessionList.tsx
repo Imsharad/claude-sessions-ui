@@ -210,7 +210,10 @@ function Group({ children, className = "" }: { children: React.ReactNode; classN
   return <span className={`inline-flex items-center gap-1.5 ${className}`}>{children}</span>;
 }
 
-/** Middle-dot separator between groups. */
+/** Middle-dot separator between groups.
+ *  The horizontal padding is the load-bearing part: it widens the inter-group
+ *  gap (~3× the intra-group gap) so the eye reads distinct clusters, not a
+ *  run-on line. The dot itself is just a faint marker. */
 function Sep() {
-  return <span className="text-ink-4">·</span>;
+  return <span className="px-1.5 text-ink-4">·</span>;
 }

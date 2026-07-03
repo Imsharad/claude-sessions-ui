@@ -115,7 +115,7 @@ function SessionCardView({ session: s, selected, onClick }: CardProps) {
       onClick={onClick}
       whileHover={{ y: -1 }}
       transition={{ type: "spring", stiffness: 400, damping: 30 }}
-      className={`group mb-2 cursor-pointer rounded-xl border p-3.5 transition ${
+      className={`group mb-2 cursor-pointer rounded-lg border p-3.5 transition ${
         selected
           ? "border-accent/40 bg-accent-soft/70 shadow-sm"
           : "border-border bg-surface hover:border-border-strong hover:shadow-sm"

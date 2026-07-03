@@ -15,7 +15,7 @@ export function FirstRun({ message }: { message: string }) {
         className="flex flex-col items-center"
       >
         <div className="relative mb-5">
-          <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent shadow-lg">
+          <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-accent shadow-lg">
             <Sparkles size={26} className="text-white" />
           </div>
         </div>

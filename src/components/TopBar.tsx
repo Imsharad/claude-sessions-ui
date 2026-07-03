@@ -34,7 +34,7 @@ export function TopBar({
       {/* Left: title + scan status */}
       <div className="flex items-center gap-3" data-tauri-drag-region>
         <div className="flex items-center gap-1.5">
-          <div className="flex h-5 w-5 items-center justify-center rounded-md bg-accent text-[11px] font-bold text-white">
+          <div className="flex h-5 w-5 items-center justify-center rounded-sm bg-accent text-[11px] font-bold text-white">
             C
           </div>
           <span className="text-[13px] font-semibold text-ink">Sessions</span>
@@ -46,8 +46,8 @@ export function TopBar({
         )}
       </div>
 
-      {/* Center: view switcher */}
-      <div className="flex items-center gap-0.5 rounded-lg bg-surface-2 p-0.5">
+      {/* Center: view switcher — input-scale (10px) so its contained chips (6px) nest within. */}
+      <div className="flex items-center gap-0.5 rounded bg-surface-2 p-0.5">
         <ViewButton
           active={view === "launcher"}
           onClick={() => onViewChange("launcher")}
@@ -91,7 +91,7 @@ export function TopBar({
           onClick={onReindex}
           disabled={reindexing}
           title="Re-scan for new sessions"
-          className="inline-flex items-center gap-1 rounded-md border border-border bg-surface px-2 py-1 text-[11px] text-ink-2 transition hover:bg-surface-3 disabled:opacity-50"
+          className="inline-flex items-center gap-1 rounded-sm border border-border bg-surface px-2 py-1 text-[11px] text-ink-2 transition hover:bg-surface-3 disabled:opacity-50"
         >
           {reindexing ? (
             <Loader2 size={11} className="animate-spin" />
@@ -119,7 +119,7 @@ function ViewButton({
   return (
     <button
       onClick={onClick}
-      className={`inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-[12px] font-medium transition ${
+      className={`inline-flex items-center gap-1 rounded-sm px-2.5 py-1 text-[12px] font-medium transition ${
         active
           ? "bg-surface text-ink shadow-xs"
           : "text-ink-3 hover:text-ink-2"

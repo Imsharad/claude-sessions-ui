@@ -127,7 +127,7 @@ export function SessionDetail({ sessionId }: Props) {
           <button
             onClick={handleResume}
             disabled={resuming}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-accent px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-accent-strong disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-sm bg-accent px-3.5 py-2 text-[12px] font-semibold text-white shadow-sm transition hover:bg-accent-strong disabled:opacity-50"
           >
             {resuming ? (
               <Loader2 size={13} className="animate-spin" />
@@ -296,7 +296,7 @@ export function SessionDetail({ sessionId }: Props) {
             >
               <ul className="space-y-1">
                 {errors.slice(0, 10).map((e, i) => (
-                  <li key={i} className="rounded-md bg-danger-soft px-2 py-1 text-[11px] text-danger">
+                  <li key={i} className="rounded-sm bg-danger-soft px-2 py-1 text-[11px] text-danger">
                     {e}
                   </li>
                 ))}
@@ -333,7 +333,7 @@ function EmptyState() {
   return (
     <div className="flex h-full flex-1 items-center justify-center bg-surface px-6">
       <div className="w-full max-w-xs">
-        <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-2xl bg-accent-soft">
+        <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-xl bg-accent-soft">
           <Sparkles size={20} className="text-accent" />
         </div>
         <p className="text-[15px] font-semibold text-ink">Select a session</p>
@@ -360,7 +360,7 @@ function Hint({ keys, label }: { keys: string[]; label: string }) {
         {keys.map((k) => (
           <kbd
             key={k}
-            className="rounded-md border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-ink-2 shadow-xs"
+            className="rounded-sm border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-ink-2 shadow-xs"
           >
             {k}
           </kbd>

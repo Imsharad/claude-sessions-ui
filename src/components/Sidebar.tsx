@@ -98,7 +98,7 @@ export function Sidebar({
             value={query}
             onChange={(e) => onQueryChange(e.target.value)}
             placeholder="Search sessions & recaps…"
-            className="w-full rounded-lg border border-border bg-surface py-2 pl-8 pr-3 text-[13px] text-ink placeholder:text-ink-4 shadow-xs transition focus:border-accent focus:outline-none"
+            className="w-full rounded border border-border bg-surface py-2 pl-8 pr-3 text-[13px] text-ink placeholder:text-ink-4 shadow-xs transition focus:border-accent focus:outline-none"
           />
         </div>
       </div>
@@ -149,7 +149,7 @@ export function Sidebar({
         {others.length > 12 && (
           <button
             onClick={() => setShowAll((v) => !v)}
-            className="mt-1 w-full rounded-md px-3 py-1.5 text-left text-[12px] text-ink-3 transition hover:bg-surface-3 hover:text-ink-2"
+            className="mt-1 w-full rounded-sm px-3 py-1.5 text-left text-[12px] text-ink-3 transition hover:bg-surface-3 hover:text-ink-2"
           >
             {showAll ? "Show less" : `Show ${others.length - 12} more`}
           </button>
@@ -196,7 +196,7 @@ function ProjectItem({
   return (
     <div
       onClick={onClick}
-      className={`group relative flex cursor-pointer items-center gap-2 rounded-lg px-3 py-1.5 text-[13px] transition ${
+      className={`group relative flex cursor-pointer items-center gap-2 rounded-sm px-3 py-1.5 text-[13px] transition ${
         active
           ? "bg-accent-soft text-accent-strong"
           : "text-ink-2 hover:bg-surface-3"

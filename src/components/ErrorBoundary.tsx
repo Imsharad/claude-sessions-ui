@@ -24,19 +24,19 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
     if (this.state.error) {
       return (
         <div className="flex h-full items-center justify-center bg-canvas p-8">
-          <div className="max-w-lg rounded-xl border border-danger/30 bg-danger-soft p-5 shadow-md">
+          <div className="max-w-lg rounded-lg border border-danger/30 bg-danger-soft p-5 shadow-md">
             <h2 className="text-[14px] font-semibold text-danger">
               Something rendered badly
             </h2>
             <p className="mt-1.5 text-[12px] text-ink-2">
               {this.state.error.message}
             </p>
-            <pre className="mt-3 max-h-48 overflow-auto rounded-md bg-surface p-2 text-[10px] text-ink-3">
+            <pre className="mt-3 max-h-48 overflow-auto rounded-sm bg-surface p-2 text-[10px] text-ink-3">
               {this.state.error.stack}
             </pre>
             <button
               onClick={() => this.setState({ error: null })}
-              className="mt-3 rounded-md bg-surface px-3 py-1.5 text-[12px] font-medium text-ink-2 shadow-xs hover:bg-surface-3"
+              className="mt-3 rounded-sm bg-surface px-3 py-1.5 text-[12px] font-medium text-ink-2 shadow-xs hover:bg-surface-3"
             >
               Try again
             </button>

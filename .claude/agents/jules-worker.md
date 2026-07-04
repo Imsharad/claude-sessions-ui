@@ -34,6 +34,14 @@ four sections; if the caller didn't provide them, synthesize them from the task 
 A task with no runnable `[Acceptance]` command is invalid — stop and report that back
 rather than dispatching a blind session.
 
+**Always append this non-blocking directive to every dispatched prompt** (Jules pausing
+at "Awaiting User Feedback" stalls the async pipeline and its diff can't be pulled via
+CLI): *"Do NOT ask questions or wait for approval. On any ambiguity, take the
+behavior-preserving default that keeps the acceptance command green, proceed to
+completion, and record every uncertainty as a `// ponytail:` comment plus a line in your
+final summary. Run to a Completed state — never stop to ask."* This makes sessions reach
+`Completed`, where `pull --apply` works hands-off.
+
 ## Procedure
 
 1. **Resolve the repo (trust boundary — validate, don't assume).**

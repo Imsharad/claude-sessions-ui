@@ -70,6 +70,27 @@ pub struct SessionCard {
     pub cost_usd: f64,
     pub cost_source: String, // 'config' | 'estimate' | 'mixed' | 'none'
     pub pinned: bool,
+    // ─── Tag & triage (F3 populates, F2 renders, F4 places) ───
+    // All nullable: absent = untagged, which the UI renders as clean absence.
+    pub area_of_life: Option<String>,
+    pub project_short_name: Option<String>,
+    pub goal_completed: Option<bool>,
+    pub completion_pct: Option<i64>,
+    pub tag_rationale: Option<String>,
+    pub tagged_at: Option<String>,
+    /// Hand-edited field names, parsed from the `manual_fields` JSON array
+    /// string. Null/invalid degrades to empty — no hand-edits, cleanly.
+    pub manual_fields: Vec<String>,
+    pub kanban_status: Option<String>,
+    pub kanban_order: Option<f64>,
+}
+
+/// Parse the `manual_fields` column (a JSON array string of field names) into a
+/// Vec. Null, empty, or invalid JSON all degrade to an empty vec.
+fn parse_manual_fields(raw: Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -242,7 +263,9 @@ fn list_sessions(filter: Option<SessionFilter>) -> Result<Vec<SessionCard>, Stri
                 COALESCE(SUM(u.input_toks),0), COALESCE(SUM(u.output_toks),0),
                 COALESCE(SUM(u.cache_read_toks),0),
                 COALESCE(SUM(u.cost_usd),0),
-                p.pinned
+                p.pinned,
+                s.area_of_life, s.project_short_name, s.goal_completed, s.completion_pct,
+                s.tag_rationale, s.tagged_at, s.manual_fields, s.kanban_status, s.kanban_order
          FROM sessions s
          LEFT JOIN session_usage u ON u.session_id = s.id
          LEFT JOIN projects p ON p.encoded_dir = s.project_dir",
@@ -315,6 +338,15 @@ fn map_session_card(r: &rusqlite::Row) -> rusqlite::Result<SessionCard> {
         cost_usd: r.get(15)?,
         cost_source: "aggregated".to_string(), // simplified; detail view has per-row source
         pinned: r.get::<_, i64>(16)? != 0,
+        area_of_life: r.get(17)?,
+        project_short_name: r.get(18)?,
+        goal_completed: r.get::<_, Option<i64>>(19)?.map(|v| v != 0),
+        completion_pct: r.get(20)?,
+        tag_rationale: r.get(21)?,
+        tagged_at: r.get(22)?,
+        manual_fields: parse_manual_fields(r.get(23)?),
+        kanban_status: r.get(24)?,
+        kanban_order: r.get(25)?,
     })
 }
 
@@ -431,7 +463,9 @@ fn get_session_detail(id: String) -> Result<SessionDetail, String> {
                         COALESCE((SELECT SUM(output_toks) FROM session_usage u WHERE u.session_id=s.id),0),
                         COALESCE((SELECT SUM(cache_read_toks) FROM session_usage u WHERE u.session_id=s.id),0),
                         COALESCE((SELECT SUM(cost_usd) FROM session_usage u WHERE u.session_id=s.id),0),
-                        COALESCE((SELECT pinned FROM projects p WHERE p.encoded_dir=s.project_dir),0)
+                        COALESCE((SELECT pinned FROM projects p WHERE p.encoded_dir=s.project_dir),0),
+                        s.area_of_life, s.project_short_name, s.goal_completed, s.completion_pct,
+                        s.tag_rationale, s.tagged_at, s.manual_fields, s.kanban_status, s.kanban_order
                  FROM sessions s WHERE s.id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -1304,11 +1338,46 @@ mod serde_tests {
             cost_usd: 0.0,
             cost_source: "none".into(),
             pinned: false,
+            area_of_life: Some("Building".into()),
+            project_short_name: Some("sessions-ui".into()),
+            goal_completed: Some(true),
+            completion_pct: Some(40),
+            tag_rationale: Some("shipped the cards".into()),
+            tagged_at: Some("2026-07-04T00:00:00Z".into()),
+            manual_fields: vec!["completionPct".into()],
+            kanban_status: Some("inProgress".into()),
+            kanban_order: Some(1.5),
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"projectDir\""), "expected camelCase projectDir, got: {}", json);
         assert!(json.contains("\"messageCount\""));
         assert!(json.contains("\"cacheReadToks\""));
         assert!(!json.contains("project_dir"), "snake_case leaked: {}", json);
+        // New tag/kanban fields must also serialize camelCase.
+        assert!(json.contains("\"areaOfLife\""), "got: {}", json);
+        assert!(json.contains("\"projectShortName\""));
+        assert!(json.contains("\"goalCompleted\""));
+        assert!(json.contains("\"completionPct\""));
+        assert!(json.contains("\"tagRationale\""));
+        assert!(json.contains("\"taggedAt\""));
+        assert!(json.contains("\"manualFields\""));
+        assert!(json.contains("\"kanbanStatus\""));
+        assert!(json.contains("\"kanbanOrder\""));
+        assert!(!json.contains("area_of_life"), "snake_case leaked: {}", json);
+    }
+
+    #[test]
+    fn manual_fields_parses_json_array_or_degrades_to_empty() {
+        assert_eq!(
+            parse_manual_fields(Some(r#"["area_of_life","completion_pct"]"#.into())),
+            vec!["area_of_life".to_string(), "completion_pct".to_string()]
+        );
+        // Empty array → empty vec.
+        assert!(parse_manual_fields(Some("[]".into())).is_empty());
+        // Null column → empty vec.
+        assert!(parse_manual_fields(None).is_empty());
+        // Invalid / non-array JSON → empty vec, never a panic.
+        assert!(parse_manual_fields(Some("not json".into())).is_empty());
+        assert!(parse_manual_fields(Some(r#"{"a":1}"#.into())).is_empty());
     }
 }

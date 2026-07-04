@@ -64,6 +64,16 @@ export interface SessionCard {
   costUsd: number;
   costSource: string;
   pinned: boolean;
+  // Tag & triage (F3 populates, F2 renders, F4 places). Null = untagged.
+  areaOfLife: string | null;
+  projectShortName: string | null;
+  goalCompleted: boolean | null;
+  completionPct: number | null;
+  tagRationale: string | null;
+  taggedAt: string | null;
+  manualFields: string[];
+  kanbanStatus: string | null;
+  kanbanOrder: number | null;
 }
 
 export interface Recap {

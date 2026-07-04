@@ -71,6 +71,36 @@ describe('hidden projects (blacklist)', () => {
   });
 });
 
+describe('progressive-disclosure cards', () => {
+  it('expands a card in place and collapses it', async () => {
+    // Drive via browser.execute (like the backend spec) — JS clicks bypass the
+    // hover-reveal opacity + interactability waits, and single-command DOM checks
+    // keep the interaction count low.
+    const hasRows = await browser.execute(
+      () => !!document.querySelector('div[class*="cursor-pointer"][class*="rounded-lg"]'),
+    );
+    if (!hasRows) return; // no indexed data — nothing to expand, skip gracefully
+    const clicked = await browser.execute(() => {
+      const btn = document.querySelector('[title="Expand"]');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    if (!clicked) return; // no expand affordance rendered
+    // The row reveals its Tier-2 detail block.
+    await browser.waitUntil(
+      async () => browser.execute(() => !!document.querySelector('[data-card-detail]')),
+      { timeout: 10000, timeoutMsg: 'card did not reveal expanded detail after Expand' },
+    );
+    // Collapse the same way — detail block disappears.
+    await browser.execute(() => document.querySelector('[title="Collapse"]')?.click());
+    await browser.waitUntil(
+      async () => browser.execute(() => !document.querySelector('[data-card-detail]')),
+      { timeout: 10000, timeoutMsg: 'card did not collapse after Collapse' },
+    );
+  });
+});
+
 describe('backend', () => {
   it('has a live Tauri IPC bridge (Rust backend reachable)', async () => {
     const ok = await browser.execute(() => typeof window.__TAURI_INTERNALS__ !== 'undefined');

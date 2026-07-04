@@ -38,50 +38,29 @@ interface Props {
 
 export function SessionDetail({ sessionId }: Props) {
   const [detail, setDetail] = useState<SessionDetailT | null>(null);
-  const [loading, setLoading] = useState(false);
   const [resumeFork, setResumeFork] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeErr, setResumeErr] = useState<string | null>(null);
 
+  const [loading, setLoading] = useState(false);
+
   useEffect(() => {
-    if (!sessionId) {
-      setDetail(null);
-      return;
-    }
-    setLoading(true);
-    setResumeErr(null);
-    getSessionDetail(sessionId)
-      .then((d) => setDetail(d))
-      .catch((e) => console.error("detail load failed", e))
-      .finally(() => setLoading(false));
+    if (!sessionId) return setDetail(null);
+    setLoading(true); setResumeErr(null);
+    getSessionDetail(sessionId).then(setDetail).catch(e => console.error(e)).finally(() => setLoading(false));
   }, [sessionId]);
 
-  async function handleResume() {
+  const handleResume = async () => {
     if (!sessionId) return;
-    setResuming(true);
-    setResumeErr(null);
-    try {
-      await resumeSession(sessionId, resumeFork);
-    } catch (e: unknown) {
-      setResumeErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setResuming(false);
-    }
-  }
+    setResuming(true); setResumeErr(null);
+    try { await resumeSession(sessionId, resumeFork); }
+    catch (e: any) { setResumeErr(e.message || String(e)); }
+    finally { setResuming(false); }
+  };
 
-  if (!sessionId) {
-    return <EmptyState />;
-  }
-  if (loading) {
-    return (
-      <div className="flex h-full items-center justify-center text-ink-3">
-        <Loader2 size={20} className="animate-spin" />
-      </div>
-    );
-  }
-  if (!detail) {
-    return <EmptyState />;
-  }
+  if (!sessionId) return <EmptyState />;
+  if (loading) return <div className="flex h-full items-center justify-center text-ink-3"><Loader2 size={20} className="animate-spin" /></div>;
+  if (!detail) return <EmptyState />;
 
   const { card, recaps, todos, usage, filesTouched, errors } = detail;
   const totalCost = usage.reduce((sum, u) => sum + u.costUsd, 0);
@@ -309,63 +288,32 @@ export function SessionDetail({ sessionId }: Props) {
   );
 }
 
-function Section({
-  icon,
-  title,
-  children,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  children: React.ReactNode;
-}) {
+function Section({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
   return (
     <section>
-      <h3 className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-ink-3">
-        <span className="text-accent">{icon}</span>
-        {title}
-      </h3>
+      <h3 className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-ink-3"><span className="text-accent">{icon}</span>{title}</h3>
       {children}
     </section>
   );
 }
 
 function EmptyState() {
+  const hints = [ { keys: ["↑", "↓"], label: "Navigate sessions" }, { keys: ["⏎"], label: "Open in detail" }, { keys: ["⌘", "K"], label: "Search (coming)" }, { keys: ["⌘", "⏎"], label: "Resume in Terminal (coming)" } ];
   return (
     <div className="flex h-full flex-1 items-center justify-center bg-surface px-6">
       <div className="w-full max-w-xs">
-        <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-xl bg-accent-soft">
-          <Sparkles size={20} className="text-accent" />
-        </div>
+        <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-xl bg-accent-soft"><Sparkles size={20} className="text-accent" /></div>
         <p className="text-[15px] font-semibold text-ink">Select a session</p>
-        <p className="mt-1 text-[12.5px] leading-relaxed text-ink-3">
-          Click any session to read its recap, todos, and usage — then resume
-          it in Terminal.
-        </p>
+        <p className="mt-1 text-[12.5px] leading-relaxed text-ink-3">Click any session to read its recap, todos, and usage — then resume it in Terminal.</p>
         <div className="mt-4 space-y-1.5 border-t border-border pt-4 text-[11px] text-ink-3">
-          <Hint keys={["↑", "↓"]} label="Navigate sessions" />
-          <Hint keys={["⏎"]} label="Open in detail" />
-          <Hint keys={["⌘", "K"]} label="Search (coming)" />
-          <Hint keys={["⌘", "⏎"]} label="Resume in Terminal (coming)" />
+          {hints.map((h, i) => (
+            <div key={i} className="flex items-center justify-between">
+              <span className="text-ink-3">{h.label}</span>
+              <span className="flex gap-1">{h.keys.map(k => <kbd key={k} className="rounded-sm border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-ink-2 shadow-xs">{k}</kbd>)}</span>
+            </div>
+          ))}
         </div>
       </div>
-    </div>
-  );
-}
-
-function Hint({ keys, label }: { keys: string[]; label: string }) {
-  return (
-    <div className="flex items-center justify-between">
-      <span className="text-ink-3">{label}</span>
-      <span className="flex gap-1">
-        {keys.map((k) => (
-          <kbd
-            key={k}
-            className="rounded-sm border border-border bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-ink-2 shadow-xs"
-          >
-            {k}
-          </kbd>
-        ))}
-      </span>
     </div>
   );
 }

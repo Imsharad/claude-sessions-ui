@@ -6,7 +6,7 @@
  *
  * View switching: Launcher (P2, this file), Analytics (P5, stub), Digest (P4).
  */
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState } from "react";
 import { TopBar, type View } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { SessionList } from "./components/SessionList";
@@ -28,8 +28,7 @@ export default function App() {
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [sessions, setSessions] = useState<SessionCard[]>([]);
   const [stats, setStats] = useState<GlobalStats | null>(null);
-  const [bootstrapping, setBootstrapping] = useState(true);
-  const [bootstrapMsg, setBootstrapMsg] = useState("Starting up…");
+  const [bootstrapping, setBootstrapping] = useState<string | false>("Starting up…");
   const [reindexing, setReindexing] = useState(false);
 
   const [view, setView] = useState<View>("launcher");
@@ -37,68 +36,34 @@ export default function App() {
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [query, setQuery] = useState("");
 
-  // Refresh sessions + status + stats from the DB.
-  const refresh = useCallback(async () => {
-    const [st, sess, gs] = await Promise.all([
-      indexStatus(),
-      listSessions(),
-      getStats(),
-    ]);
-    setStatus(st);
-    setSessions(sess);
-    setStats(gs);
+  // ponytail: Drop redundant useCallback, it's fine to recreate on re-render for App shell
+  const refresh = async () => {
+    const [st, sess, gs] = await Promise.all([indexStatus(), listSessions(), getStats()]);
+    setStatus(st); setSessions(sess); setStats(gs);
+  };
+
+  useEffect(() => {
+    indexStatus().then(async (st) => {
+      setBootstrapping(st.sessionCount === 0 ? "Reading your Claude sessions for the first time…" : "Checking for new sessions…");
+      await reindex(st.sessionCount === 0);
+      await refresh();
+      setBootstrapping(false);
+    }).catch(e => console.error(e));
   }, []);
 
-  // First-run bootstrap: if no sessions indexed, do a full scan; else incremental.
-  useEffect(() => {
-    (async () => {
-      try {
-        const st = await indexStatus();
-        if (st.sessionCount === 0) {
-          setBootstrapMsg("Reading your Claude sessions for the first time…");
-          await reindex(true);
-        } else {
-          // Background incremental — keep the UI snappy.
-          setBootstrapMsg("Checking for new sessions…");
-          await reindex(false);
-        }
-        await refresh();
-      } catch (e) {
-        console.error("bootstrap failed", e);
-      } finally {
-        setBootstrapping(false);
-      }
-    })();
-  }, [refresh]);
-
-  const handleReindex = useCallback(async () => {
+  const handleReindex = async () => {
     setReindexing(true);
-    try {
-      await reindex(false);
-      await refresh();
-    } catch (e) {
-      console.error("reindex failed", e);
-    } finally {
-      setReindexing(false);
-    }
-  }, [refresh]);
+    try { await reindex(false); await refresh(); }
+    catch (e) { console.error(e); }
+    finally { setReindexing(false); }
+  };
 
-  // Filter sessions client-side by project + query (server already filters, but
-  // this keeps the sidebar's live counts coherent).
-  const visibleSessions =
-    selectedProject || query
-      ? sessions.filter(
-          (s) =>
-            (!selectedProject || s.projectDir === selectedProject) &&
-            (!query ||
-              s.title.toLowerCase().includes(query.toLowerCase()) ||
-              (s.recap && s.recap.toLowerCase().includes(query.toLowerCase()))),
-        )
-      : sessions;
+  const visibleSessions = sessions.filter(s =>
+    (!selectedProject || s.projectDir === selectedProject) &&
+    (!query || (s.title + (s.recap || "")).toLowerCase().includes(query.toLowerCase()))
+  );
 
-  if (bootstrapping) {
-    return <FirstRun message={bootstrapMsg} />;
-  }
+  if (bootstrapping !== false) return <FirstRun message={bootstrapping} />;
 
   return (
     <ErrorBoundary>

@@ -115,105 +115,43 @@ function SessionCardView({ session: s, selected, onClick }: CardProps) {
       onClick={onClick}
       whileHover={{ y: -1 }}
       transition={{ type: "spring", stiffness: 400, damping: 30 }}
-      className={`group mb-2 cursor-pointer rounded-lg border p-3.5 transition ${
-        selected
-          ? "border-accent/40 bg-accent-soft/70 shadow-sm"
-          : "border-border bg-surface hover:border-border-strong hover:shadow-sm"
-      }`}
+      className={`group mb-2 cursor-pointer rounded-lg border p-3.5 transition ${selected ? "border-accent/40 bg-accent-soft/70 shadow-sm" : "border-border bg-surface hover:border-border-strong hover:shadow-sm"}`}
     >
-      {/* Hero: the recap (or title fallback). Sharper weight when recap-led. */}
       <div className="flex items-start gap-2">
-        {hasRecap && (
-          <Sparkles
-            size={13}
-            className="mt-[3px] shrink-0 text-accent"
-            aria-label="has recap"
-          />
-        )}
-        <p
-          className={`flex-1 leading-snug ${
-            hasRecap
-              ? "text-[13.5px] font-medium text-ink"           // recap = hero, darker + slightly larger
-              : "text-[13px] text-ink-2"                        // title fallback = quieter
-          }`}
-        >
+        {hasRecap && <Sparkles size={13} className="mt-[3px] shrink-0 text-accent" />}
+        <p className={`flex-1 leading-snug ${hasRecap ? "text-[13.5px] font-medium text-ink" : "text-[13px] text-ink-2"}`}>
           {headline}
         </p>
-        <ChevronRight
-          size={15}
-          className={`mt-[3px] shrink-0 transition ${
-            selected ? "text-accent" : "text-ink-4 group-hover:text-ink-3"
-          }`}
-        />
+        <ChevronRight size={15} className={`mt-[3px] shrink-0 transition ${selected ? "text-accent" : "text-ink-4 group-hover:text-ink-3"}`} />
       </div>
 
-      {/* Subtitle: the session title — only when a recap leads, and quieter. */}
       {hasRecap && s.title && s.title !== "(untitled session)" && (
-        <div className="mt-0.5 truncate pl-[21px] text-[11.5px] text-ink-3">
-          {s.title}
-        </div>
+        <div className="mt-0.5 truncate pl-[21px] text-[11.5px] text-ink-3">{s.title}</div>
       )}
 
-      {/* Meta row — grouped: (project · branch) | (time · msgs · dur) | (cost · tokens)
-          Separated by middle-dots so the eye groups, not runs-on. */}
       <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 pl-[21px] text-[11px] text-ink-3">
-        <Group>
+        <span className="inline-flex items-center gap-1.5">
           <span className="font-medium text-ink-2">{s.displayProject}</span>
-          {s.gitBranch && (
-            <span className="inline-flex items-center gap-0.5 font-mono text-ink-3">
-              <GitBranch size={10} />
-              {s.gitBranch}
-            </span>
-          )}
-        </Group>
-        <Sep />
-        <Group>
-          <span className="inline-flex items-center gap-0.5">
-            <Clock size={10} />
-            {relativeTime(s.lastTs)}
-          </span>
-          <span className="inline-flex items-center gap-0.5 tabular-nums">
-            <MessageSquare size={10} />
-            {s.messageCount}
-          </span>
+          {s.gitBranch && <span className="inline-flex items-center gap-0.5 font-mono text-ink-3"><GitBranch size={10} />{s.gitBranch}</span>}
+        </span>
+        <span className="px-1.5 text-ink-4">·</span>
+        <span className="inline-flex items-center gap-1.5">
+          <span className="inline-flex items-center gap-0.5"><Clock size={10} />{relativeTime(s.lastTs)}</span>
+          <span className="inline-flex items-center gap-0.5 tabular-nums"><MessageSquare size={10} />{s.messageCount}</span>
           {s.durationMs > 0 && <span className="tabular-nums">{formatDuration(s.durationMs)}</span>}
-        </Group>
-        {(s.costUsd > 0.05 || s.inputToks > 0) && <Sep />}
-        <Group className="ml-auto">
-          {s.costUsd > 0.05 && (
-            <span className="rounded-full bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-ink-2">
-              {formatCost(s.costUsd)}
-            </span>
-          )}
-          {s.inputToks > 0 && (
-            <span className="font-mono text-[10px] tabular-nums text-ink-4">
-              {formatTokens(s.inputToks + s.outputToks)}
-            </span>
-          )}
-        </Group>
+        </span>
+        {(s.costUsd > 0.05 || s.inputToks > 0) && <span className="px-1.5 text-ink-4">·</span>}
+        <span className="ml-auto inline-flex items-center gap-1.5">
+          {s.costUsd > 0.05 && <span className="rounded-full bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-ink-2">{formatCost(s.costUsd)}</span>}
+          {s.inputToks > 0 && <span className="font-mono text-[10px] tabular-nums text-ink-4">{formatTokens(s.inputToks + s.outputToks)}</span>}
+        </span>
       </div>
 
-      {/* Plan-mode badge */}
       {s.planMode && (
         <div className="mt-1.5 pl-[21px]">
-          <span className="rounded-full bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent-strong">
-            plan mode
-          </span>
+          <span className="rounded-full bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent-strong">plan mode</span>
         </div>
       )}
     </motion.div>
   );
-}
-
-/** Visually group a set of meta items (no separator between them). */
-function Group({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return <span className={`inline-flex items-center gap-1.5 ${className}`}>{children}</span>;
-}
-
-/** Middle-dot separator between groups.
- *  The horizontal padding is the load-bearing part: it widens the inter-group
- *  gap (~3× the intra-group gap) so the eye reads distinct clusters, not a
- *  run-on line. The dot itself is just a faint marker. */
-function Sep() {
-  return <span className="px-1.5 text-ink-4">·</span>;
 }

@@ -8,7 +8,7 @@
  * Selection drives the SessionList filter. Pinning persists via the
  * toggle_pin command (writes through to SQLite).
  */
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Search, Star, Folder, Hash } from "lucide-react";
 import type { SessionCard } from "../lib/ipc";
 import { togglePin } from "../lib/ipc";
@@ -42,58 +42,40 @@ export function Sidebar({
 }: SidebarProps) {
   const [showAll, setShowAll] = useState(false);
 
-  // Build project groups from sessions.
-  const { pinned, others } = useMemo(() => {
-    const map = new Map<string, ProjectGroup>();
-    for (const s of sessions) {
-      const existing = map.get(s.projectDir);
-      if (existing) {
-        existing.count += 1;
-        if (s.lastTs && (!existing.lastTs || s.lastTs > existing.lastTs)) {
-          existing.lastTs = s.lastTs;
-        }
-      } else {
-        map.set(s.projectDir, {
-          projectDir: s.projectDir,
-          cwd: s.cwd,
-          display: s.displayProject || s.cwd.split("/").pop() || s.cwd,
-          count: 1,
-          pinned: s.pinned,
-          lastTs: s.lastTs,
-        });
-      }
-    }
-    const all = [...map.values()].sort((a, b) => {
-      // pinned first, then most recent
-      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-      return (b.lastTs || "").localeCompare(a.lastTs || "");
-    });
-    return {
-      pinned: all.filter((g) => g.pinned),
-      others: all.filter((g) => !g.pinned),
-    };
-  }, [sessions]);
-
-  const visibleOthers = showAll ? others : others.slice(0, 12);
-
-  async function handlePin(group: ProjectGroup) {
-    try {
-      await togglePin(group.projectDir);
-      onPinnedChange();
-    } catch (e) {
-      console.error("pin failed", e);
+  // ponytail: Drop useMemo, computing groups is fast enough for <1000 items
+  const map = new Map<string, ProjectGroup>();
+  for (const s of sessions) {
+    const existing = map.get(s.projectDir);
+    if (existing) {
+      existing.count += 1;
+      if (s.lastTs && (!existing.lastTs || s.lastTs > existing.lastTs)) existing.lastTs = s.lastTs;
+    } else {
+      map.set(s.projectDir, {
+        projectDir: s.projectDir,
+        cwd: s.cwd,
+        display: s.displayProject || s.cwd.split("/").pop() || s.cwd,
+        count: 1,
+        pinned: s.pinned,
+        lastTs: s.lastTs,
+      });
     }
   }
+  
+  const allGroups = [...map.values()].sort((a, b) => a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : (b.lastTs || "").localeCompare(a.lastTs || ""));
+  const pinned = allGroups.filter((g) => g.pinned);
+  const others = allGroups.filter((g) => !g.pinned);
+  const visibleOthers = showAll ? others : others.slice(0, 12);
+
+  const handlePin = async (dir: string) => {
+    try { await togglePin(dir); onPinnedChange(); }
+    catch (e) { console.error("pin failed", e); }
+  };
 
   return (
     <aside className="flex h-full w-64 flex-col border-r border-border bg-surface-2/50">
-      {/* Search */}
       <div className="p-3 pb-2">
         <div className="relative">
-          <Search
-            size={14}
-            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-3"
-          />
+          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink-3" />
           <input
             value={query}
             onChange={(e) => onQueryChange(e.target.value)}
@@ -104,69 +86,25 @@ export function Sidebar({
       </div>
 
       <nav className="flex-1 overflow-y-auto px-2 pb-4">
-        {/* All sessions — styled like a project item, not a chunky pill */}
-        <ProjectItem
-          active={selectedProject === null}
-          onClick={() => onSelectProject(null)}
-          icon={<Hash size={14} />}
-          label="All sessions"
-          count={sessions.length}
-          countStyle="muted"
-        />
+        <ProjectItem active={selectedProject === null} onClick={() => onSelectProject(null)} icon={<Hash size={14} />} label="All sessions" count={sessions.length} countStyle="muted" />
 
-        {/* Pinned */}
-        {pinned.length > 0 && (
-          <SectionLabel>Pinned</SectionLabel>
-        )}
+        {pinned.length > 0 && <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">Pinned</div>}
         {pinned.map((g) => (
-          <ProjectItem
-            key={g.projectDir}
-            active={selectedProject === g.projectDir}
-            onClick={() => onSelectProject(g.projectDir)}
-            icon={<Star size={14} className="fill-warn text-warn" />}
-            label={g.display}
-            sublabel={shortCwd(g.cwd)}
-            count={g.count}
-            onPin={() => handlePin(g)}
-            pinned
-          />
+          <ProjectItem key={g.projectDir} active={selectedProject === g.projectDir} onClick={() => onSelectProject(g.projectDir)} icon={<Star size={14} className="fill-warn text-warn" />} label={g.display} sublabel={shortCwd(g.cwd)} count={g.count} onPin={() => handlePin(g.projectDir)} pinned />
         ))}
 
-        {/* All projects */}
-        <SectionLabel>Projects {others.length > 12 && !showAll && `(${others.length})`}</SectionLabel>
+        <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">Projects {others.length > 12 && !showAll && `(${others.length})`}</div>
         {visibleOthers.map((g) => (
-          <ProjectItem
-            key={g.projectDir}
-            active={selectedProject === g.projectDir}
-            onClick={() => onSelectProject(g.projectDir)}
-            icon={<Folder size={14} className="text-ink-3" />}
-            label={g.display}
-            sublabel={shortCwd(g.cwd)}
-            count={g.count}
-            onPin={() => handlePin(g)}
-          />
+          <ProjectItem key={g.projectDir} active={selectedProject === g.projectDir} onClick={() => onSelectProject(g.projectDir)} icon={<Folder size={14} className="text-ink-3" />} label={g.display} sublabel={shortCwd(g.cwd)} count={g.count} onPin={() => handlePin(g.projectDir)} />
         ))}
         {others.length > 12 && (
-          <button
-            onClick={() => setShowAll((v) => !v)}
-            className="mt-1 w-full rounded-sm px-3 py-1.5 text-left text-[12px] text-ink-3 transition hover:bg-surface-3 hover:text-ink-2"
-          >
+          <button onClick={() => setShowAll((v) => !v)} className="mt-1 w-full rounded-sm px-3 py-1.5 text-left text-[12px] text-ink-3 transition hover:bg-surface-3 hover:text-ink-2">
             {showAll ? "Show less" : `Show ${others.length - 12} more`}
           </button>
         )}
-        {others.length === 0 && pinned.length === 0 && (
-          <p className="px-3 py-2 text-[12px] text-ink-4">No projects indexed.</p>
-        )}
+        {others.length === 0 && pinned.length === 0 && <p className="px-3 py-2 text-[12px] text-ink-4">No projects indexed.</p>}
       </nav>
     </aside>
-  );
-}
-
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">
-      {children}
-    </div>
   );
 }
 

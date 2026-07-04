@@ -207,6 +207,16 @@ export function SessionCardView({
       : truncate(s.recap!, 180)
     : truncate(s.title || "(untitled)", 120);
   const shortProject = s.projectShortName ?? s.displayProject;
+  // Has this session been tagged (auto or hand-edited)? Drives Tier-2 content:
+  // tagged rows deepen with rationale, untagged rows offer an inline tag action.
+  const isTagged = Boolean(
+    s.taggedAt ||
+      s.areaOfLife ||
+      s.projectShortName ||
+      s.tagRationale ||
+      s.completionPct != null ||
+      s.goalCompleted != null,
+  );
 
   return (
     <motion.div
@@ -328,33 +338,57 @@ export function SessionCardView({
           data-card-detail
           className="mt-2.5 space-y-2 border-t border-border pl-[21px] pt-2.5 text-[11.5px] text-ink-2"
         >
-          {/* Duration + message count, spelled out (Tier 2 detail). */}
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-ink-3">
-            <span className="inline-flex items-center gap-1 tabular-nums">
-              <MessageSquare size={11} />
-              {s.messageCount} message{s.messageCount === 1 ? "" : "s"}
-            </span>
-            {s.durationMs > 0 && (
-              <span className="inline-flex items-center gap-1 tabular-nums">
-                <Clock size={11} />
-                {formatDuration(s.durationMs)}
-              </span>
-            )}
-          </div>
-
-          {/* Tag fields present — each renders only when set. */}
-          {(s.projectShortName || s.areaOfLife || s.completionPct != null || s.goalCompleted === true) && (
-            <div className="flex flex-wrap items-center gap-1.5">
-              {s.projectShortName && (
-                <span className="font-medium text-ink">{s.projectShortName}</span>
+          {isTagged ? (
+            <>
+              {/* Tag fields present — each renders only when set. */}
+              {(s.projectShortName || s.areaOfLife || s.completionPct != null || s.goalCompleted === true) && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {s.projectShortName && (
+                    <span className="font-medium text-ink">{s.projectShortName}</span>
+                  )}
+                  <AreaChip area={s.areaOfLife} />
+                  <CompletionBadge session={s} />
+                </div>
               )}
-              <AreaChip area={s.areaOfLife} />
-              <CompletionBadge session={s} />
-            </div>
-          )}
 
-          {s.tagRationale && (
-            <p className="leading-snug text-ink-2">{s.tagRationale}</p>
+              {/* The "why" a glance can't give — quiet one-liner. */}
+              {s.tagRationale && (
+                <p className="leading-snug text-ink-3">{s.tagRationale}</p>
+              )}
+            </>
+          ) : (
+            /* Untagged: an inline quick-tag action (Feature 3 on the card),
+               sharing the same handleQuickTag/tagging/tagFailed state as the
+               hover Wand2 button. idle -> loading (accent) -> error (retry). */
+            <div className="flex flex-wrap items-center gap-2">
+              {tagFailed ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={handleQuickTag}
+                    className="inline-flex items-center gap-1 font-medium text-accent hover:text-accent-strong"
+                  >
+                    <Wand2 size={12} />
+                    Retry tagging
+                  </button>
+                  <span className="text-[11px] text-ink-3">{tagFailed}</span>
+                </>
+              ) : tagging ? (
+                <span className="inline-flex items-center gap-1.5 text-accent">
+                  <Loader2 size={12} className="animate-spin" />
+                  Tagging…
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleQuickTag}
+                  className="inline-flex items-center gap-1 font-medium text-accent hover:text-accent-strong"
+                >
+                  <Wand2 size={12} />
+                  Tag session
+                </button>
+              )}
+            </div>
           )}
         </div>
       )}

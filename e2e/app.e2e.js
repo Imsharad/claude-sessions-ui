@@ -118,6 +118,44 @@ describe('AI session tagging', () => {
   });
 });
 
+describe('kanban board', () => {
+  it('toggles to the board (three columns or a board-level empty state) and back to the list', async () => {
+    // Drive via browser.execute like the other specs — bypasses hover/interactability.
+    // Toggle to the board view.
+    const toBoard = await browser.execute(() => {
+      const btn = document.querySelector('[title="Board view"]');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    expect(toBoard).toBe(true);
+
+    // Either the three column headers render, or (nothing tagged) the board-level
+    // empty state invites tagging — both are valid, data-dependent, graceful.
+    await browser.waitUntil(
+      async () =>
+        browser.execute(() => {
+          // innerText reflects CSS text-transform (headers are uppercased), so
+          // compare case-insensitively.
+          const text = document.body.innerText.toLowerCase();
+          const cols =
+            text.includes('planned') && text.includes('in progress') && text.includes('completed');
+          const empty = text.includes('the board is for tagged work');
+          return cols || empty;
+        }),
+      { timeout: 10000, timeoutMsg: 'board view showed neither columns nor the empty state' },
+    );
+
+    // Toggle back to the list — the session-count heading (an <h2>, list-only) returns.
+    await browser.execute(() => document.querySelector('[title="List view"]')?.click());
+    await browser.waitUntil(
+      async () => browser.execute(() => !!document.querySelector('h2')),
+      { timeout: 10000, timeoutMsg: 'list view did not restore after toggling back from the board' },
+    );
+    await expect($('h2')).toBeExisting();
+  });
+});
+
 describe('backend', () => {
   it('has a live Tauri IPC bridge (Rust backend reachable)', async () => {
     const ok = await browser.execute(() => typeof window.__TAURI_INTERNALS__ !== 'undefined');

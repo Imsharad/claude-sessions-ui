@@ -3,26 +3,33 @@
  * stats summary, and reindex action. Drag region for the window (Tauri native
  * feel — the bar moves the window on macOS).
  */
-import { RefreshCw, Loader2, Layers, BarChart3, BookOpen } from "lucide-react";
+import { RefreshCw, Loader2, Layers, BarChart3, BookOpen, List, LayoutGrid } from "lucide-react";
 import type { IndexStatus, GlobalStats } from "../lib/ipc";
 import { formatTokens, formatCost } from "../lib/format";
 
 export type View = "launcher" | "analytics" | "digest";
+export type LauncherMode = "list" | "board";
 
 interface Props {
   view: View;
   onViewChange: (v: View) => void;
+  launcherMode: LauncherMode;
+  onLauncherModeChange: (m: LauncherMode) => void;
   status: IndexStatus | null;
   stats: GlobalStats | null;
   reindexing: boolean;
   onReindex: () => void;
 }
 
-export function TopBar({ view, onViewChange, status, stats, reindexing, onReindex }: Props) {
+export function TopBar({ view, onViewChange, launcherMode, onLauncherModeChange, status, stats, reindexing, onReindex }: Props) {
   const views: { id: View; label: string; icon: React.ReactNode }[] = [
     { id: "launcher", label: "Launcher", icon: <Layers size={12} /> },
     { id: "analytics", label: "Analytics", icon: <BarChart3 size={12} /> },
     { id: "digest", label: "Digest", icon: <BookOpen size={12} /> },
+  ];
+  const modes: { id: LauncherMode; label: string; icon: React.ReactNode }[] = [
+    { id: "list", label: "List view", icon: <List size={12} /> },
+    { id: "board", label: "Board view", icon: <LayoutGrid size={12} /> },
   ];
 
   return (
@@ -37,17 +44,37 @@ export function TopBar({ view, onViewChange, status, stats, reindexing, onReinde
         )}
       </div>
 
-      <div className="flex items-center gap-0.5 rounded bg-surface-2 p-0.5">
-        {views.map((v) => (
-          <button
-            key={v.id}
-            onClick={() => onViewChange(v.id)}
-            className={`inline-flex items-center gap-1 rounded-sm px-2.5 py-1 text-[12px] font-medium transition ${view === v.id ? "bg-surface text-ink shadow-xs" : "text-ink-3 hover:text-ink-2"}`}
-          >
-            {v.icon}
-            {v.label}
-          </button>
-        ))}
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-0.5 rounded bg-surface-2 p-0.5">
+          {views.map((v) => (
+            <button
+              key={v.id}
+              onClick={() => onViewChange(v.id)}
+              className={`inline-flex items-center gap-1 rounded-sm px-2.5 py-1 text-[12px] font-medium transition ${view === v.id ? "bg-surface text-ink shadow-xs" : "text-ink-3 hover:text-ink-2"}`}
+            >
+              {v.icon}
+              {v.label}
+            </button>
+          ))}
+        </div>
+
+        {/* List | board toggle — a quiet second segmented control, only in the
+            launcher. Same pill styling as the views group; icon-only to stay
+            subordinate. */}
+        {view === "launcher" && (
+          <div className="flex items-center gap-0.5 rounded bg-surface-2 p-0.5">
+            {modes.map((m) => (
+              <button
+                key={m.id}
+                title={m.label}
+                onClick={() => onLauncherModeChange(m.id)}
+                className={`inline-flex items-center justify-center rounded-sm px-2 py-1 transition ${launcherMode === m.id ? "bg-surface text-ink shadow-xs" : "text-ink-3 hover:text-ink-2"}`}
+              >
+                {m.icon}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="flex items-center gap-3">

@@ -7,9 +7,10 @@
  * View switching: Launcher (P2, this file), Analytics (P5, stub), Digest (P4).
  */
 import { useEffect, useState } from "react";
-import { TopBar, type View } from "./components/TopBar";
+import { TopBar, type View, type LauncherMode } from "./components/TopBar";
 import { Sidebar } from "./components/Sidebar";
 import { SessionList } from "./components/SessionList";
+import { KanbanBoard } from "./components/KanbanBoard";
 import { SessionDetail } from "./components/SessionDetail";
 import { FirstRun } from "./components/FirstRun";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -32,6 +33,7 @@ export default function App() {
   const [reindexing, setReindexing] = useState(false);
 
   const [view, setView] = useState<View>("launcher");
+  const [launcherMode, setLauncherMode] = useState<LauncherMode>("list");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [query, setQuery] = useState("");
@@ -71,6 +73,8 @@ export default function App() {
         <TopBar
           view={view}
           onViewChange={setView}
+          launcherMode={launcherMode}
+          onLauncherModeChange={setLauncherMode}
           status={status}
           stats={stats}
           reindexing={reindexing}
@@ -91,12 +95,21 @@ export default function App() {
               onPinnedChange={refresh}
               onBlacklistChange={refresh}
             />
-            <SessionList
-              sessions={visibleSessions}
-              selectedId={selectedSession}
-              onSelect={setSelectedSession}
-              onSessionsChanged={refresh}
-            />
+            {launcherMode === "board" ? (
+              <KanbanBoard
+                sessions={visibleSessions}
+                selectedId={selectedSession}
+                onSelect={setSelectedSession}
+                onSessionsChanged={refresh}
+              />
+            ) : (
+              <SessionList
+                sessions={visibleSessions}
+                selectedId={selectedSession}
+                onSelect={setSelectedSession}
+                onSessionsChanged={refresh}
+              />
+            )}
             <div className="flex w-[420px] shrink-0 flex-col border-l border-border">
               <SessionDetail sessionId={selectedSession} />
             </div>

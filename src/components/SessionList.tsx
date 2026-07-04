@@ -136,6 +136,10 @@ interface CardProps {
   onClick: () => void;
   onToggleExpand: () => void;
   onTagged?: () => void;
+  /** Board reuse: hide the expand-in-place chevron (Tier 2 lives in the list). */
+  hideExpand?: boolean;
+  /** Board reuse: a quiet extra line under the meta (e.g. the "% changed" hint). */
+  footer?: React.ReactNode;
 }
 
 /** Small quiet completion badge — garnish, never louder than the recap.
@@ -166,13 +170,15 @@ function AreaChip({ area }: { area: string | null }) {
   );
 }
 
-function SessionCardView({
+export function SessionCardView({
   session: s,
   selected,
   expanded,
   onClick,
   onToggleExpand,
   onTagged,
+  hideExpand,
+  footer,
 }: CardProps) {
   // Card-level quick tag: fires tagSession, refreshes on success, shows a quiet
   // transient error (icon turns danger, reverts on next hover). Never silent.
@@ -238,21 +244,24 @@ function SessionCardView({
           )}
         </button>
         {/* Expand affordance — quiet, appears on hover like the pin pattern.
-            stopPropagation so it toggles the tier without selecting the row. */}
-        <button
-          type="button"
-          title={expanded ? "Collapse" : "Expand"}
-          onClick={(e) => {
-            e.stopPropagation();
-            onToggleExpand();
-          }}
-          className={`mt-[1px] shrink-0 rounded p-0.5 text-ink-4 transition hover:text-ink-2 group-hover:opacity-100 ${expanded ? "opacity-100" : "opacity-0"}`}
-        >
-          <ChevronDown
-            size={14}
-            className={`transition-transform ${expanded ? "rotate-180" : ""}`}
-          />
-        </button>
+            stopPropagation so it toggles the tier without selecting the row.
+            Hidden on the board (Tier 2 expand-in-place lives in the list). */}
+        {!hideExpand && (
+          <button
+            type="button"
+            title={expanded ? "Collapse" : "Expand"}
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleExpand();
+            }}
+            className={`mt-[1px] shrink-0 rounded p-0.5 text-ink-4 transition hover:text-ink-2 group-hover:opacity-100 ${expanded ? "opacity-100" : "opacity-0"}`}
+          >
+            <ChevronDown
+              size={14}
+              className={`transition-transform ${expanded ? "rotate-180" : ""}`}
+            />
+          </button>
+        )}
         <ChevronRight
           size={15}
           className={`mt-[3px] shrink-0 transition ${selected ? "text-accent" : "text-ink-4 group-hover:text-ink-3"}`}
@@ -311,6 +320,8 @@ function SessionCardView({
           </span>
         </div>
       )}
+
+      {footer && <div className="mt-1.5 pl-[21px]">{footer}</div>}
 
       {expanded && (
         <div

@@ -270,3 +270,13 @@ export const tagSession = (id: string): Promise<SessionTags> =>
 
 export const updateSessionTags = (id: string, patch: TagPatch): Promise<SessionTags> =>
   call<SessionTags>("update_session_tags", { id, ...patch });
+
+// Kanban board (F4). The three columns; a drag sets an explicit status override
+// (null clears it, falling back to the %-derived column) plus a per-column order.
+export type KanbanStatus = "planned" | "in_progress" | "completed";
+
+export const setKanban = (
+  id: string,
+  status: KanbanStatus | null,
+  order: number | null,
+): Promise<void> => call<void>("set_kanban", { id, status, order });

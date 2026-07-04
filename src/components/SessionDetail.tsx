@@ -20,9 +20,23 @@ import {
   FileCode,
   AlertTriangle,
   TrendingUp,
+  Wand2,
+  Tags,
 } from "lucide-react";
-import type { SessionDetail as SessionDetailT } from "../lib/ipc";
-import { getSessionDetail, resumeSession } from "../lib/ipc";
+import type {
+  SessionDetail as SessionDetailT,
+  SessionTags,
+  TagPatch,
+  TagError,
+} from "../lib/ipc";
+import {
+  getSessionDetail,
+  resumeSession,
+  tagSession,
+  updateSessionTags,
+  asTagError,
+  AREAS_OF_LIFE,
+} from "../lib/ipc";
 import {
   relativeTime,
   formatTokens,
@@ -44,9 +58,13 @@ export function SessionDetail({ sessionId }: Props) {
 
   const [loading, setLoading] = useState(false);
 
+  // Tagging state (F3). Errors carry a `kind` so we can special-case cli_not_found.
+  const [tagging, setTagging] = useState(false);
+  const [tagErr, setTagErr] = useState<TagError | null>(null);
+
   useEffect(() => {
     if (!sessionId) return setDetail(null);
-    setLoading(true); setResumeErr(null);
+    setLoading(true); setResumeErr(null); setTagErr(null);
     getSessionDetail(sessionId).then(setDetail).catch(e => console.error(e)).finally(() => setLoading(false));
   }, [sessionId]);
 
@@ -56,6 +74,27 @@ export function SessionDetail({ sessionId }: Props) {
     try { await resumeSession(sessionId, resumeFork); }
     catch (e: any) { setResumeErr(e.message || String(e)); }
     finally { setResuming(false); }
+  };
+
+  // Fold fresh tag fields into the loaded detail, no reload.
+  const applyTags = (t: SessionTags) =>
+    setDetail((d) => (d ? { ...d, card: { ...d.card, ...t } } : d));
+
+  const handleTag = async () => {
+    if (!sessionId) return;
+    setTagging(true); setTagErr(null);
+    try { applyTags(await tagSession(sessionId)); }
+    catch (e) { setTagErr(asTagError(e)); }
+    finally { setTagging(false); }
+  };
+
+  // A single hand-edited field commit (change/blur). Updates state from the
+  // authoritative response so the manual dot marker appears immediately.
+  const commitTag = async (patch: TagPatch) => {
+    if (!sessionId) return;
+    setTagErr(null);
+    try { applyTags(await updateSessionTags(sessionId, patch)); }
+    catch (e) { setTagErr(asTagError(e)); }
   };
 
   if (!sessionId) return <EmptyState />;
@@ -115,6 +154,20 @@ export function SessionDetail({ sessionId }: Props) {
             )}
             Resume in Terminal
           </button>
+          {/* Tag session — secondary action (bordered, not a second filled accent). */}
+          <button
+            onClick={handleTag}
+            disabled={tagging}
+            title="Classify this session with AI"
+            className="inline-flex items-center gap-1.5 rounded-sm border border-border bg-surface px-3 py-2 text-[12px] font-medium text-ink-2 shadow-xs transition hover:border-border-strong hover:text-ink disabled:opacity-50"
+          >
+            {tagging ? (
+              <Loader2 size={13} className="animate-spin text-accent" />
+            ) : (
+              <Wand2 size={13} />
+            )}
+            Tag session
+          </button>
           <label className="inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-ink-3">
             <input
               type="checkbox"
@@ -128,6 +181,21 @@ export function SessionDetail({ sessionId }: Props) {
             <span className="text-[11px] text-danger">⚠ {resumeErr}</span>
           )}
         </div>
+
+        {/* Quiet tag error line + retry (never a silent failure). */}
+        {tagErr && (
+          <div className="mt-2 flex items-center gap-2 text-[11px] text-ink-3">
+            <span className={tagErr.kind === "cli_not_found" ? "text-ink-2" : "text-danger"}>
+              {tagErr.message}
+            </span>
+            <button
+              onClick={handleTag}
+              className="rounded-sm px-1 font-medium text-accent transition hover:text-accent-strong"
+            >
+              Retry
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Scrollable body */}
@@ -162,6 +230,16 @@ export function SessionDetail({ sessionId }: Props) {
               </div>
             </Section>
           )}
+
+          {/* Tags — subordinate garnish to the recap, editable inline. */}
+          <Section icon={<Tags size={13} />} title="Tags">
+            <TagsBody
+              card={card}
+              tagging={tagging}
+              onTag={handleTag}
+              onCommit={commitTag}
+            />
+          </Section>
 
           {/* Todos */}
           {todos.length > 0 && (
@@ -285,6 +363,157 @@ export function SessionDetail({ sessionId }: Props) {
         </motion.div>
       </div>
     </div>
+  );
+}
+
+/** 4px accent dot marking a hand-edited field (auto-tag will not overwrite it).
+ *  A quiet marker, never a banner. */
+function ManualDot({ show }: { show: boolean }) {
+  if (!show) return null;
+  return (
+    <span
+      title="Edited by hand — auto-tag will not overwrite"
+      className="inline-block h-1 w-1 shrink-0 rounded-full bg-accent"
+    />
+  );
+}
+
+function FieldLabel({ children, manual }: { children: React.ReactNode; manual: boolean }) {
+  return (
+    <span className="inline-flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-ink-4">
+      {children}
+      <ManualDot show={manual} />
+    </span>
+  );
+}
+
+/** The editable Tags body. Absent tags → the tag-session prompt, no empty
+ *  scaffolding. Present → editable select/input/number/checkbox, each commit
+ *  calls updateSessionTags and the parent folds the response back into state. */
+function TagsBody({
+  card,
+  tagging,
+  onTag,
+  onCommit,
+}: {
+  card: SessionTags & { taggedAt: string | null };
+  tagging: boolean;
+  onTag: () => void;
+  onCommit: (patch: TagPatch) => void;
+}) {
+  const manual = card.manualFields ?? [];
+  const isManual = (f: string) => manual.includes(f);
+  const tagged =
+    card.taggedAt != null ||
+    card.areaOfLife != null ||
+    card.projectShortName != null ||
+    card.completionPct != null ||
+    card.goalCompleted != null;
+
+  if (!tagged) {
+    return (
+      <div className="flex items-center gap-2 text-[12px] text-ink-3">
+        <span>Not tagged yet.</span>
+        <button
+          onClick={onTag}
+          disabled={tagging}
+          className="inline-flex items-center gap-1 font-medium text-accent transition hover:text-accent-strong disabled:opacity-50"
+        >
+          {tagging ? <Loader2 size={12} className="animate-spin" /> : <Wand2 size={12} />}
+          Tag it
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 4 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ type: "spring", stiffness: 400, damping: 30 }}
+      className="space-y-2.5"
+    >
+      <div className="flex flex-wrap items-start gap-x-6 gap-y-2.5">
+        {/* Area */}
+        <label className="flex flex-col gap-1">
+          <FieldLabel manual={isManual("areaOfLife")}>Area</FieldLabel>
+          <select
+            value={card.areaOfLife ?? ""}
+            onChange={(e) => onCommit({ areaOfLife: e.target.value })}
+            className="rounded-sm border border-border bg-surface px-2 py-1 text-[12px] text-ink-2 transition hover:border-border-strong focus:border-accent focus:outline-none"
+          >
+            {card.areaOfLife == null && <option value="">—</option>}
+            {AREAS_OF_LIFE.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* Short name */}
+        <label className="flex flex-col gap-1">
+          <FieldLabel manual={isManual("projectShortName")}>Short name</FieldLabel>
+          <input
+            key={`name-${card.projectShortName ?? ""}`}
+            type="text"
+            defaultValue={card.projectShortName ?? ""}
+            maxLength={24}
+            onBlur={(e) => {
+              const v = e.target.value.trim();
+              if (v && v !== (card.projectShortName ?? "")) onCommit({ projectShortName: v });
+            }}
+            className="w-40 rounded-sm border border-border bg-surface px-2 py-1 text-[12px] text-ink-2 transition hover:border-border-strong focus:border-accent focus:outline-none"
+          />
+        </label>
+
+        {/* Completion % */}
+        <label className="flex flex-col gap-1">
+          <FieldLabel manual={isManual("completionPct")}>Completion %</FieldLabel>
+          <input
+            key={`pct-${card.completionPct ?? 0}`}
+            type="number"
+            min={0}
+            max={100}
+            defaultValue={card.completionPct ?? 0}
+            onBlur={(e) => {
+              const n = Math.max(0, Math.min(100, Math.round(Number(e.target.value) || 0)));
+              if (n !== (card.completionPct ?? 0)) onCommit({ completionPct: n });
+            }}
+            className="w-20 rounded-sm border border-border bg-surface px-2 py-1 text-[12px] tabular-nums text-ink-2 transition hover:border-border-strong focus:border-accent focus:outline-none"
+          />
+        </label>
+
+        {/* Goal completed */}
+        <label className="flex flex-col gap-1">
+          <FieldLabel manual={isManual("goalCompleted")}>Goal done</FieldLabel>
+          <span className="inline-flex h-[27px] items-center">
+            <input
+              type="checkbox"
+              checked={card.goalCompleted === true}
+              onChange={(e) => onCommit({ goalCompleted: e.target.checked })}
+              className="accent-accent"
+            />
+          </span>
+        </label>
+      </div>
+
+      {card.tagRationale && (
+        <p className="text-[11.5px] italic leading-snug text-ink-3" style={{ maxWidth: "60ch" }}>
+          {card.tagRationale}
+        </p>
+      )}
+
+      <button
+        onClick={onTag}
+        disabled={tagging}
+        title="Re-run AI tagging (overwrites auto fields only)"
+        className="inline-flex items-center gap-1 text-[11px] font-medium text-ink-3 transition hover:text-accent disabled:opacity-50"
+      >
+        {tagging ? <Loader2 size={11} className="animate-spin text-accent" /> : <Wand2 size={11} />}
+        Re-tag
+      </button>
+    </motion.div>
   );
 }
 

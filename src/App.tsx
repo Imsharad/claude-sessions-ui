@@ -95,6 +95,7 @@ export default function App() {
               sessions={visibleSessions}
               selectedId={selectedSession}
               onSelect={setSelectedSession}
+              onSessionsChanged={refresh}
             />
             <div className="flex w-[420px] shrink-0 flex-col border-l border-border">
               <SessionDetail sessionId={selectedSession} />

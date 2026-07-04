@@ -225,6 +225,29 @@ pub struct BlacklistEntry {
     pub match_count: i64,
 }
 
+use claude::TagError;
+
+/// Controlled area-of-life vocabulary (the editable one-liner from the spec).
+/// Server-side validation normalizes the model's output against this list.
+const AREAS_OF_LIFE: [&str; 5] = ["Building", "Research", "Content", "Ops", "Personal"];
+
+/// The tagging model — fast + cheap, present in the pricing table.
+const TAGGING_MODEL: &str = "claude-haiku-4-5";
+
+/// The tag fields returned to the frontend after a tag / edit. camelCase over
+/// the wire, mirrored by `SessionTags` in ipc.ts.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTags {
+    pub area_of_life: Option<String>,
+    pub project_short_name: Option<String>,
+    pub goal_completed: Option<bool>,
+    pub completion_pct: Option<i64>,
+    pub tag_rationale: Option<String>,
+    pub tagged_at: Option<String>,
+    pub manual_fields: Vec<String>,
+}
+
 // ─── Commands ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1079,6 +1102,345 @@ fn set_pricing(rows: Vec<PricingRow>) -> Result<(), String> {
     Ok(())
 }
 
+// ─── AI session tagging (Feature 3) ─────────────────────────────────────────
+// One structured call over a session's recap + metadata → strict JSON → server-
+// side validation → persist. Transport is the headless local `claude` CLI
+// (claude.rs), not an HTTP client. Auto fields never clobber a hand-edited
+// field (manual_fields protection); a hand edit adds the field to that list.
+//
+// manual_fields stores the *camelCase* field identifiers ("areaOfLife",
+// "projectShortName", "goalCompleted", "completionPct") so the frontend can
+// check membership directly against its field keys.
+
+/// Context assembled from the DB for one session, fed into the tag prompt.
+struct TagContext {
+    title: String,
+    project: String,
+    message_count: i64,
+    duration_ms: i64,
+    recap: Option<String>,
+    todos_total: i64,
+    todos_done: i64,
+}
+
+/// Validated tag values after server-side checks (area in vocab, pct clamped,
+/// short name trimmed + truncated). The shape we actually persist.
+#[derive(Debug)]
+struct ValidatedTags {
+    area_of_life: String,
+    project_short_name: String,
+    goal_completed: bool,
+    completion_pct: i64,
+    rationale: String,
+}
+
+fn db_err(e: impl std::fmt::Display) -> TagError {
+    TagError::new("db", e.to_string())
+}
+
+/// Case-normalize an area against the controlled vocabulary. None if not a
+/// member (rejected server-side; the model does not get to invent areas).
+fn normalize_area(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    AREAS_OF_LIFE
+        .iter()
+        .find(|a| a.eq_ignore_ascii_case(t))
+        .map(|a| a.to_string())
+}
+
+/// Add a field name to a manual_fields list, deduped. Pure so it is unit-tested.
+fn with_manual_field(mut manual: Vec<String>, field: &str) -> Vec<String> {
+    if !manual.iter().any(|m| m == field) {
+        manual.push(field.to_string());
+    }
+    manual
+}
+
+/// Pull the first `{`…last `}` JSON object out of the model's result text.
+/// Models sometimes wrap JSON in prose or ```json fences; this tolerates that.
+/// Anything that still fails to parse → typed "invalid_json", never a silent
+/// pass.
+fn extract_json_object(text: &str) -> Result<serde_json::Value, TagError> {
+    let (start, end) = match (text.find('{'), text.rfind('}')) {
+        (Some(s), Some(e)) if e > s => (s, e),
+        _ => return Err(TagError::new("invalid_json", "model output contained no JSON object")),
+    };
+    serde_json::from_str(&text[start..=end])
+        .map_err(|e| TagError::new("invalid_json", format!("model JSON did not parse: {e}")))
+}
+
+/// Validate + normalize the model's JSON object into ValidatedTags. Every
+/// missing/ill-typed field, or an area outside the vocabulary, → "invalid_json".
+fn validate_tags(v: &serde_json::Value) -> Result<ValidatedTags, TagError> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| TagError::new("invalid_json", "expected a JSON object"))?;
+
+    let area_raw = obj
+        .get("area_of_life")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| TagError::new("invalid_json", "missing/invalid area_of_life"))?;
+    let area_of_life = normalize_area(area_raw).ok_or_else(|| {
+        TagError::new("invalid_json", format!("area_of_life '{area_raw}' not in vocabulary"))
+    })?;
+
+    let name_raw = obj
+        .get("project_short_name")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| TagError::new("invalid_json", "missing/invalid project_short_name"))?;
+    let trimmed = name_raw.trim();
+    if trimmed.is_empty() {
+        return Err(TagError::new("invalid_json", "project_short_name was empty"));
+    }
+    let project_short_name: String = trimmed.chars().take(24).collect();
+
+    let goal_completed = obj
+        .get("goal_completed")
+        .and_then(|x| x.as_bool())
+        .ok_or_else(|| TagError::new("invalid_json", "missing/invalid goal_completed"))?;
+
+    let pct_val = obj
+        .get("completion_pct")
+        .ok_or_else(|| TagError::new("invalid_json", "missing completion_pct"))?;
+    // Accept int or float (models sometimes emit 85.0); round, then clamp 0-100.
+    let pct = pct_val
+        .as_i64()
+        .or_else(|| pct_val.as_f64().map(|f| f.round() as i64))
+        .ok_or_else(|| TagError::new("invalid_json", "completion_pct was not a number"))?
+        .clamp(0, 100);
+
+    let rationale = obj
+        .get("rationale")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Ok(ValidatedTags {
+        area_of_life,
+        project_short_name,
+        goal_completed,
+        completion_pct: pct,
+        rationale,
+    })
+}
+
+/// Compact classification prompt: the controlled vocabulary + the session's
+/// recap and metadata, demanding ONLY a strict JSON object.
+fn build_tag_prompt(ctx: &TagContext) -> String {
+    let areas = AREAS_OF_LIFE.join(", ");
+    let recap = ctx.recap.as_deref().unwrap_or("(no recap was captured for this session)");
+    format!(
+        "You are triaging one Claude Code coding session. Classify it from its \
+recap and metadata.\n\n\
+Metadata:\n\
+- Title: {title}\n\
+- Project: {project}\n\
+- Messages: {msgs}\n\
+- Duration (ms): {dur}\n\
+- Todos completed: {done}/{total}\n\n\
+Recap (auto-generated summary of what happened):\n{recap}\n\n\
+Return ONLY a strict JSON object, no prose and no markdown fences, with EXACTLY \
+these five keys:\n\
+{{\n\
+  \"area_of_life\": one of [{areas}],\n\
+  \"project_short_name\": a SHORT human name for the project, never a path, at most 24 characters,\n\
+  \"goal_completed\": true or false,\n\
+  \"completion_pct\": an integer from 0 to 100,\n\
+  \"rationale\": one sentence justifying the completion judgement\n\
+}}",
+        title = ctx.title,
+        project = ctx.project,
+        msgs = ctx.message_count,
+        dur = ctx.duration_ms,
+        done = ctx.todos_done,
+        total = ctx.todos_total,
+        recap = recap,
+        areas = areas,
+    )
+}
+
+/// Load the recap + metadata used to build the tag prompt.
+fn load_tag_context(conn: &rusqlite::Connection, id: &str) -> Result<TagContext, TagError> {
+    let (title, cwd, message_count, duration_ms, recap): (String, String, i64, i64, Option<String>) =
+        conn.query_row(
+            "SELECT COALESCE(s.title,''), s.cwd, s.message_count, s.duration_ms,
+                    (SELECT content FROM recaps r WHERE r.session_id = s.id AND r.is_final = 1)
+             FROM sessions s WHERE s.id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .map_err(db_err)?;
+    let (todos_total, todos_done): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),0)
+             FROM todos WHERE session_id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    Ok(TagContext {
+        title,
+        project: project_display(&cwd),
+        message_count,
+        duration_ms,
+        recap,
+        todos_total,
+        todos_done,
+    })
+}
+
+/// Read the current manual_fields list for a session (empty if unset/invalid).
+fn load_manual_fields(conn: &rusqlite::Connection, id: &str) -> Vec<String> {
+    let raw: Option<String> = conn
+        .query_row("SELECT manual_fields FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
+        .ok()
+        .flatten();
+    parse_manual_fields(raw)
+}
+
+/// Read back the persisted tag fields as the wire struct.
+fn read_session_tags(conn: &rusqlite::Connection, id: &str) -> Result<SessionTags, TagError> {
+    conn.query_row(
+        "SELECT area_of_life, project_short_name, goal_completed, completion_pct,
+                tag_rationale, tagged_at, manual_fields
+         FROM sessions WHERE id = ?1",
+        params![id],
+        |r| {
+            Ok(SessionTags {
+                area_of_life: r.get(0)?,
+                project_short_name: r.get(1)?,
+                goal_completed: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                completion_pct: r.get(3)?,
+                tag_rationale: r.get(4)?,
+                tagged_at: r.get(5)?,
+                manual_fields: parse_manual_fields(r.get(6)?),
+            })
+        },
+    )
+    .map_err(db_err)
+}
+
+/// Persist auto tags: write each auto field ONLY where its camelCase name is
+/// NOT in manual_fields (hand-edit protection). tag_rationale + tagged_at are
+/// always written (tagged_at is not user-editable).
+fn persist_auto_tags(
+    conn: &rusqlite::Connection,
+    id: &str,
+    v: &ValidatedTags,
+) -> Result<SessionTags, TagError> {
+    let manual = load_manual_fields(conn, id);
+    let auto = |field: &str| !manual.iter().any(|m| m == field);
+
+    if auto("areaOfLife") {
+        conn.execute(
+            "UPDATE sessions SET area_of_life = ?1 WHERE id = ?2",
+            params![v.area_of_life, id],
+        )
+        .map_err(db_err)?;
+    }
+    if auto("projectShortName") {
+        conn.execute(
+            "UPDATE sessions SET project_short_name = ?1 WHERE id = ?2",
+            params![v.project_short_name, id],
+        )
+        .map_err(db_err)?;
+    }
+    if auto("goalCompleted") {
+        conn.execute(
+            "UPDATE sessions SET goal_completed = ?1 WHERE id = ?2",
+            params![v.goal_completed as i64, id],
+        )
+        .map_err(db_err)?;
+    }
+    if auto("completionPct") {
+        conn.execute(
+            "UPDATE sessions SET completion_pct = ?1 WHERE id = ?2",
+            params![v.completion_pct, id],
+        )
+        .map_err(db_err)?;
+    }
+    conn.execute(
+        "UPDATE sessions SET tag_rationale = ?1, tagged_at = ?2 WHERE id = ?3",
+        params![v.rationale, chrono::Utc::now().to_rfc3339(), id],
+    )
+    .map_err(db_err)?;
+
+    read_session_tags(conn, id)
+}
+
+/// Core (blocking) tag flow: load context → CLI → validate → persist. Split out
+/// so the async command wraps it in spawn_blocking and the ignored integration
+/// test can call it directly.
+fn tag_session_blocking(id: &str) -> Result<SessionTags, TagError> {
+    let conn = db::open().map_err(db_err)?;
+    let ctx = load_tag_context(&conn, id)?;
+    let prompt = build_tag_prompt(&ctx);
+    let result_text = claude::run_headless(&prompt, TAGGING_MODEL)?;
+    let json = extract_json_object(&result_text)?;
+    let validated = validate_tags(&json)?;
+    persist_auto_tags(&conn, id, &validated)
+}
+
+/// One-shot AI tag. Async so the UI stays responsive; the blocking CLI call
+/// runs on the blocking pool (tauri::async_runtime, no tokio dependency added).
+#[tauri::command]
+async fn tag_session(id: String) -> Result<SessionTags, TagError> {
+    tauri::async_runtime::spawn_blocking(move || tag_session_blocking(&id))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("tag task failed to join: {e}")))?
+}
+
+/// Hand-edit path: apply ONLY the provided fields, validate, and flag each
+/// edited field in manual_fields (deduped) so a future auto-tag won't clobber
+/// it. Synchronous — no CLI involved.
+#[tauri::command]
+fn update_session_tags(
+    id: String,
+    area_of_life: Option<String>,
+    project_short_name: Option<String>,
+    goal_completed: Option<bool>,
+    completion_pct: Option<i64>,
+) -> Result<SessionTags, TagError> {
+    let conn = db::open().map_err(db_err)?;
+    let mut manual = load_manual_fields(&conn, &id);
+
+    if let Some(area) = area_of_life {
+        let norm = normalize_area(&area).ok_or_else(|| {
+            TagError::new("invalid_json", format!("area '{area}' not in vocabulary"))
+        })?;
+        conn.execute("UPDATE sessions SET area_of_life = ?1 WHERE id = ?2", params![norm, id])
+            .map_err(db_err)?;
+        manual = with_manual_field(manual, "areaOfLife");
+    }
+    if let Some(name) = project_short_name {
+        let n: String = name.trim().chars().take(24).collect();
+        conn.execute("UPDATE sessions SET project_short_name = ?1 WHERE id = ?2", params![n, id])
+            .map_err(db_err)?;
+        manual = with_manual_field(manual, "projectShortName");
+    }
+    if let Some(goal) = goal_completed {
+        conn.execute(
+            "UPDATE sessions SET goal_completed = ?1 WHERE id = ?2",
+            params![goal as i64, id],
+        )
+        .map_err(db_err)?;
+        manual = with_manual_field(manual, "goalCompleted");
+    }
+    if let Some(pct) = completion_pct {
+        let pct = pct.clamp(0, 100);
+        conn.execute("UPDATE sessions SET completion_pct = ?1 WHERE id = ?2", params![pct, id])
+            .map_err(db_err)?;
+        manual = with_manual_field(manual, "completionPct");
+    }
+
+    let mf = serde_json::to_string(&manual).unwrap_or_else(|_| "[]".to_string());
+    conn.execute("UPDATE sessions SET manual_fields = ?1 WHERE id = ?2", params![mf, id])
+        .map_err(db_err)?;
+
+    read_session_tags(&conn, &id)
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 // Pure-logic probes for the ranker + snippet extractor. The DB-backed
 // search_recaps is exercised end-to-end via the running app; these cover the
@@ -1231,6 +1593,80 @@ mod tests {
         );
     }
 
+    // ─── Tagging pure logic ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_json_object_handles_fences_and_prefix() {
+        // Fenced.
+        let fenced = "```json\n{\"area_of_life\":\"Building\"}\n```";
+        assert!(extract_json_object(fenced).is_ok());
+        // Prose prefix + suffix.
+        let prosey = "Sure, here you go: {\"completion_pct\": 40} — hope that helps!";
+        let v = extract_json_object(prosey).unwrap();
+        assert_eq!(v.get("completion_pct").and_then(|x| x.as_i64()), Some(40));
+        // No object at all.
+        assert_eq!(extract_json_object("no json here").unwrap_err().kind, "invalid_json");
+    }
+
+    #[test]
+    fn validate_tags_rejects_bad_area_and_clamps_pct() {
+        // Valid, case-insensitive area + float pct rounds and passes.
+        let ok = serde_json::json!({
+            "area_of_life": "building",
+            "project_short_name": "  sessions-ui  ",
+            "goal_completed": true,
+            "completion_pct": 84.6,
+            "rationale": "shipped it"
+        });
+        let v = validate_tags(&ok).unwrap();
+        assert_eq!(v.area_of_life, "Building"); // normalized to canonical casing
+        assert_eq!(v.project_short_name, "sessions-ui"); // trimmed
+        assert_eq!(v.completion_pct, 85); // rounded
+
+        // Pct out of range clamps.
+        let hi = serde_json::json!({
+            "area_of_life": "Ops", "project_short_name": "x",
+            "goal_completed": false, "completion_pct": 250, "rationale": ""
+        });
+        assert_eq!(validate_tags(&hi).unwrap().completion_pct, 100);
+
+        // Area outside the vocabulary is rejected.
+        let bad = serde_json::json!({
+            "area_of_life": "Gardening", "project_short_name": "x",
+            "goal_completed": false, "completion_pct": 0, "rationale": ""
+        });
+        assert_eq!(validate_tags(&bad).unwrap_err().kind, "invalid_json");
+
+        // Empty short name is rejected.
+        let empty = serde_json::json!({
+            "area_of_life": "Ops", "project_short_name": "   ",
+            "goal_completed": false, "completion_pct": 0, "rationale": ""
+        });
+        assert_eq!(validate_tags(&empty).unwrap_err().kind, "invalid_json");
+    }
+
+    #[test]
+    fn validate_tags_truncates_long_short_name() {
+        let long = serde_json::json!({
+            "area_of_life": "Building",
+            "project_short_name": "this-is-a-very-long-project-name-way-over-limit",
+            "goal_completed": true, "completion_pct": 10, "rationale": "x"
+        });
+        assert_eq!(validate_tags(&long).unwrap().project_short_name.chars().count(), 24);
+    }
+
+    #[test]
+    fn with_manual_field_dedups() {
+        let m = with_manual_field(vec![], "completionPct");
+        assert_eq!(m, vec!["completionPct".to_string()]);
+        // Re-adding is a no-op.
+        let m = with_manual_field(m, "completionPct");
+        assert_eq!(m, vec!["completionPct".to_string()]);
+        // A different field appends.
+        let m = with_manual_field(m, "areaOfLife");
+        assert_eq!(m, vec!["completionPct".to_string(), "areaOfLife".to_string()]);
+    }
+
     /// End-to-end probe against the real indexed DB. Ignored by default
     /// (requires a populated ~/.claude-sessions-ui/index.sqlite). Run with:
     ///   cargo test --lib search_recaps_against_real_db -- --ignored --nocapture
@@ -1274,6 +1710,56 @@ mod tests {
             );
         }
     }
+
+    /// Real CLI round-trip against the indexed DB. Ignored by default (spends
+    /// real haiku tokens + needs a populated index). Run with:
+    ///   cargo test --lib tag_session_against_real_db -- --ignored --nocapture
+    /// Confirms: valid JSON parsed, fields persisted, and a manually-set field
+    /// survives a re-tag (manual_fields protection).
+    #[test]
+    #[ignore]
+    fn tag_session_against_real_db() {
+        let conn = db::open().expect("open db");
+        let id: String = conn
+            .query_row(
+                "SELECT s.id FROM sessions s
+                 WHERE EXISTS (SELECT 1 FROM recaps r WHERE r.session_id = s.id AND r.is_final = 1)
+                 ORDER BY s.last_ts DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("need at least one recap-bearing session");
+        println!("tagging real session {id}");
+
+        // Set completion_pct by hand FIRST — it must survive the auto-tag below.
+        let before = update_session_tags(id.clone(), None, None, None, Some(42))
+            .expect("manual update ok");
+        assert_eq!(before.completion_pct, Some(42));
+        assert!(before.manual_fields.contains(&"completionPct".to_string()));
+
+        // Run the real one-shot AI tag.
+        let tags = tag_session_blocking(&id).expect("tag_session core ok");
+        println!(
+            "MODEL OUTPUT → area={:?} shortName={:?} goalCompleted={:?} completionPct={:?}\n  rationale={:?}\n  manualFields={:?}",
+            tags.area_of_life,
+            tags.project_short_name,
+            tags.goal_completed,
+            tags.completion_pct,
+            tags.tag_rationale,
+            tags.manual_fields,
+        );
+
+        // Auto fields populated + valid.
+        let area = tags.area_of_life.as_deref().expect("area set");
+        assert!(AREAS_OF_LIFE.contains(&area), "area '{area}' must be in vocabulary");
+        assert!(tags.project_short_name.is_some(), "short name set");
+        assert!(tags.tag_rationale.is_some(), "rationale set");
+        assert!(tags.tagged_at.is_some(), "tagged_at set");
+
+        // The hand-edited completion_pct must NOT have been clobbered.
+        assert_eq!(tags.completion_pct, Some(42), "manual completion_pct must survive re-tag");
+        assert!(tags.manual_fields.contains(&"completionPct".to_string()));
+    }
 }
 
 // ─── App entry ──────────────────────────────────────────────────────────────
@@ -1307,6 +1793,8 @@ pub fn run() {
             list_blacklist,
             add_blacklist_pattern,
             remove_blacklist_pattern,
+            tag_session,
+            update_session_tags,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

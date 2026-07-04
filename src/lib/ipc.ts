@@ -177,6 +177,44 @@ export interface BlacklistEntry {
   matchCount: number;
 }
 
+/** The controlled area-of-life vocabulary (mirrors AREAS_OF_LIFE in lib.rs). */
+export const AREAS_OF_LIFE = ["Building", "Research", "Content", "Ops", "Personal"] as const;
+
+/** Tag fields returned by tag_session / update_session_tags. Mirrors
+ *  SessionTags in lib.rs. Null = unset. */
+export interface SessionTags {
+  areaOfLife: string | null;
+  projectShortName: string | null;
+  goalCompleted: boolean | null;
+  completionPct: number | null;
+  tagRationale: string | null;
+  taggedAt: string | null;
+  manualFields: string[];
+}
+
+/** Fields a hand-edit can patch (each Some field is validated + flagged manual). */
+export interface TagPatch {
+  areaOfLife?: string;
+  projectShortName?: string;
+  goalCompleted?: boolean;
+  completionPct?: number;
+}
+
+/** Typed error the tag commands reject with — tauri rejects with the serialized
+ *  object, so a catch block should be typed as this (branch on `kind`). */
+export interface TagError {
+  kind: "cli_not_found" | "timeout" | "cli_failed" | "bad_output" | "invalid_json" | "db";
+  message: string;
+}
+
+/** Coerce an unknown thrown value (tauri reject) into a TagError. */
+export function asTagError(e: unknown): TagError {
+  if (e && typeof e === "object" && "kind" in e && "message" in e) {
+    return e as TagError;
+  }
+  return { kind: "cli_failed", message: e instanceof Error ? e.message : String(e) };
+}
+
 // ─── Command wrappers ──────────────────────────────────────────────────
 // Each mirrors a #[tauri::command] in lib.rs. Args are passed as-is; Rust
 // deserializes with the same camelCase convention.
@@ -223,3 +261,12 @@ export const addBlacklistPattern = (pattern: string): Promise<BlacklistEntry[]> 
 
 export const removeBlacklistPattern = (pattern: string): Promise<BlacklistEntry[]> =>
   call<BlacklistEntry[]>("remove_blacklist_pattern", { pattern });
+
+// AI tagging (F3). tag_session shells out to the local claude CLI (may take a
+// second or two); update_session_tags is a synchronous hand-edit. Both reject
+// with a serialized TagError — catch with asTagError().
+export const tagSession = (id: string): Promise<SessionTags> =>
+  call<SessionTags>("tag_session", { id });
+
+export const updateSessionTags = (id: string, patch: TagPatch): Promise<SessionTags> =>
+  call<SessionTags>("update_session_tags", { id, ...patch });

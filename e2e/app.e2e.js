@@ -101,6 +101,23 @@ describe('progressive-disclosure cards', () => {
   });
 });
 
+describe('AI session tagging', () => {
+  it('exposes an enabled tag control on each card (does not invoke the CLI)', async () => {
+    // Presence/enabled check only — invoking tag_session would shell out to the
+    // real claude CLI (real tokens, ~10s+). We never click it here.
+    const hasRows = await browser.execute(
+      () => !!document.querySelector('div[class*="cursor-pointer"][class*="rounded-lg"]'),
+    );
+    if (!hasRows) return; // no indexed data — nothing to tag, skip gracefully
+    const state = await browser.execute(() => {
+      const btn = document.querySelector('[title="Tag session"]');
+      return btn ? { exists: true, disabled: btn.disabled } : { exists: false };
+    });
+    expect(state.exists).toBe(true);
+    expect(state.disabled).toBe(false);
+  });
+});
+
 describe('backend', () => {
   it('has a live Tauri IPC bridge (Rust backend reachable)', async () => {
     const ok = await browser.execute(() => typeof window.__TAURI_INTERNALS__ !== 'undefined');

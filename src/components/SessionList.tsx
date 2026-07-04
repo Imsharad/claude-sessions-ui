@@ -19,8 +19,11 @@ import {
   Sparkles,
   ChevronRight,
   ChevronDown,
+  Wand2,
+  Loader2,
 } from "lucide-react";
 import type { SessionCard } from "../lib/ipc";
+import { tagSession, asTagError } from "../lib/ipc";
 import {
   relativeTime,
   formatTokens,
@@ -36,9 +39,11 @@ interface SessionListProps {
   sessions: SessionCard[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  /** Refresh after a card-level tag so the fresh chip/badge appear. */
+  onSessionsChanged?: () => void;
 }
 
-export function SessionList({ sessions, selectedId, onSelect }: SessionListProps) {
+export function SessionList({ sessions, selectedId, onSelect, onSessionsChanged }: SessionListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   // Expansion lives outside the virtualized row so it survives windowing
   // unmount/remount. A Set keeps toggles O(1) and lets many rows stay open.
@@ -113,6 +118,7 @@ export function SessionList({ sessions, selectedId, onSelect }: SessionListProps
                   expanded={expanded.has(s.id)}
                   onClick={() => onSelect(s.id)}
                   onToggleExpand={() => toggleExpanded(s.id)}
+                  onTagged={onSessionsChanged}
                 />
               </div>
             );
@@ -129,6 +135,7 @@ interface CardProps {
   expanded: boolean;
   onClick: () => void;
   onToggleExpand: () => void;
+  onTagged?: () => void;
 }
 
 /** Small quiet completion badge — garnish, never louder than the recap.
@@ -165,7 +172,27 @@ function SessionCardView({
   expanded,
   onClick,
   onToggleExpand,
+  onTagged,
 }: CardProps) {
+  // Card-level quick tag: fires tagSession, refreshes on success, shows a quiet
+  // transient error (icon turns danger, reverts on next hover). Never silent.
+  const [tagging, setTagging] = useState(false);
+  const [tagFailed, setTagFailed] = useState<string | null>(null);
+
+  const handleQuickTag = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setTagging(true);
+    setTagFailed(null);
+    try {
+      await tagSession(s.id);
+      onTagged?.();
+    } catch (err) {
+      setTagFailed(asTagError(err).message);
+    } finally {
+      setTagging(false);
+    }
+  };
+
   // Recap-led: the recap (or title fallback) is the headline — the hero.
   const hasRecap = Boolean(s.recap);
   const headline = hasRecap
@@ -190,6 +217,26 @@ function SessionCardView({
         >
           {headline}
         </p>
+        {/* Quick tag — hover-reveal like the expand chevron; stopPropagation so
+            it tags without selecting the row. Spinner uses the accent; on error
+            the icon turns danger with the message as its title, reverting on the
+            next hover. */}
+        <button
+          type="button"
+          title={tagFailed ?? "Tag session"}
+          onClick={handleQuickTag}
+          onMouseEnter={() => tagFailed && setTagFailed(null)}
+          disabled={tagging}
+          className={`mt-[1px] shrink-0 rounded p-0.5 transition group-hover:opacity-100 ${
+            tagFailed ? "text-danger opacity-100" : "text-ink-4 hover:text-accent"
+          } ${tagging ? "opacity-100" : "opacity-0"}`}
+        >
+          {tagging ? (
+            <Loader2 size={14} className="animate-spin text-accent" />
+          ) : (
+            <Wand2 size={14} />
+          )}
+        </button>
         {/* Expand affordance — quiet, appears on hover like the pin pattern.
             stopPropagation so it toggles the tier without selecting the row. */}
         <button

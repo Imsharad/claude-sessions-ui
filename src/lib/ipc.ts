@@ -104,8 +104,15 @@ export interface RecapHit {
   sessionId: string;
   title: string;
   cwd: string;
+  project: string;
   capturedTs: string | null;
-  snippet: string;
+  /** Windowed snippet around the best-match region. The frontend highlights
+   *  `snippetMatch` between `snippetBefore`/`snippetAfter`. */
+  snippetBefore: string;
+  snippetMatch: string;
+  snippetAfter: string;
+  /** Ranker score (higher = more relevant). Surfaced for debug/transparency. */
+  score: number;
 }
 
 export interface DigestDay {

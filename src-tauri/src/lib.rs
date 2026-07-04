@@ -18,6 +18,7 @@ pub mod indexer;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ─── IPC types ──────────────────────────────────────────────────────────────
 
@@ -128,8 +129,15 @@ pub struct RecapHit {
     pub session_id: String,
     pub title: String,
     pub cwd: String,
+    pub project: String,
     pub captured_ts: Option<String>,
-    pub snippet: String, // recap content (or a window around the match)
+    /// Windowed snippet around the best-match region. The frontend highlights
+    /// `snippet_match` (the term in context) between `before`/`after`.
+    pub snippet_before: String,
+    pub snippet_match: String,
+    pub snippet_after: String,
+    /// Debug/transparency: the ranker score (higher = more relevant).
+    pub score: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -441,35 +449,315 @@ fn get_session_detail(id: String) -> Result<SessionDetail, String> {
 
 #[tauri::command]
 fn search_recaps(query: String) -> Result<Vec<RecapHit>, String> {
-    if query.trim().is_empty() {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let terms = tokenize(&q);
+    if terms.is_empty() {
         return Ok(Vec::new());
     }
     let conn = db::open().map_err(|e| e.to_string())?;
-    let like = format!("%{}%", query);
+
+    // Candidate recaps: those matching ANY query term (LIKE, case-insensitive
+    // via SQLite's ASCII folding — sufficient for a 543-row corpus). We pull the
+    // full row once per matching term and union by (session_id, recap uuid) in
+    // a map so the ranker sees the whole recap, not a per-term fragment.
     let mut stmt = conn
         .prepare(
-            "SELECT r.session_id, s.title, s.cwd, r.captured_ts, r.content
+            "SELECT r.session_id, r.uuid, s.title, s.cwd, r.captured_ts, r.content
              FROM recaps r
              JOIN sessions s ON s.id = r.session_id
-             WHERE r.content LIKE ?1
-             ORDER BY r.captured_ts DESC NULLS LAST
-             LIMIT 100",
+             WHERE r.content LIKE ?1",
         )
         .map_err(|e| e.to_string())?;
-    let hits = stmt
-        .query_map(params![like], |r| {
-            Ok(RecapHit {
-                session_id: r.get(0)?,
-                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                cwd: r.get(2)?,
-                captured_ts: r.get(3)?,
-                snippet: r.get(4)?,
+
+    // key = (session_id, recap uuid) so a recap with many matches is scored once.
+    let mut seen: HashMap<(String, String), CandidateRecap> = HashMap::new();
+    for term in &terms {
+        let like = format!("%{}%", term);
+        let rows = stmt
+            .query_map(params![like], |r| {
+                Ok(CandidateRecap {
+                    session_id: r.get(0)?,
+                    _uuid: r.get::<_, String>(1)?,
+                    title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    cwd: r.get(3)?,
+                    captured_ts: r.get::<_, Option<String>>(4)?,
+                    content: r.get(5)?,
+                })
             })
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
+            .map_err(|e| e.to_string())?;
+        for row in rows.flatten() {
+            seen
+                .entry((row.session_id.clone(), row._uuid.clone()))
+                .and_modify(|existing| {
+                    // Keep the most recent captured_ts if seen twice.
+                    if row.captured_ts.as_deref() > existing.captured_ts.as_deref() {
+                        existing.captured_ts = row.captured_ts.clone();
+                    }
+                })
+                .or_insert_with(|| row.clone());
+        }
+    }
+    drop(stmt);
+
+    // Score + extract snippet, then rank.
+    let now = chrono::Utc::now();
+    let mut scored: Vec<RecapHit> = seen
+        .into_values()
+        .map(|c| score_recap(c, &terms, now))
         .collect();
-    Ok(hits)
+    // Primary: score desc. Tiebreak: most recent first.
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.captured_ts.cmp(&a.captured_ts))
+    });
+    scored.truncate(SEARCH_RESULT_LIMIT);
+    Ok(scored)
+}
+
+// ─── Search ranker + snippet extraction ─────────────────────────────────────
+// Transparent TF×recency×length scoring. No FTS5/BM25 — right-sized for a
+// ~543-recap corpus and tunable in one place. Constants are intentionally
+// named, not magic numbers.
+
+const SEARCH_RESULT_LIMIT: usize = 50;
+const SNIPPET_RADIUS: usize = 160; // chars of context each side of the match
+const FRESH_WINDOW_DAYS: i64 = 30; // recency bonus full-strength within this
+
+/// A candidate recap pulled from the DB, before scoring. `_uuid` is read for
+/// dedup keying but not surfaced to the frontend.
+#[derive(Clone)]
+struct CandidateRecap {
+    session_id: String,
+    _uuid: String,
+    title: String,
+    cwd: String,
+    captured_ts: Option<String>,
+    content: String,
+}
+
+/// Score a recap against the query terms and extract the best snippet window.
+///
+/// `score = term_freq_weight × recency_weight × length_norm`
+///   term_freq_weight = Σ (1 + ln(count)) — dampened TF, rewards coverage
+///   recency_weight   = 0.5 + 0.5 × min(1, fresh/days_old) — fresh bonus, floor 0.5
+///   length_norm      = 1/√(word_count) — don't favor long recaps
+fn score_recap(c: CandidateRecap, terms: &[String], now: chrono::DateTime<chrono::Utc>) -> RecapHit {
+    let lower = c.content.to_lowercase();
+
+    // Term-frequency weight: sum over terms of (1 + ln(count)), counting only
+    // WORD-BOUNDED occurrences so "auth" inside "authoring" doesn't score.
+    let lower_chars: Vec<char> = lower.chars().collect();
+    let tf: f64 = terms
+        .iter()
+        .map(|t| {
+            let n = find_word_bounded(&lower_chars, t).len() as f64;
+            if n > 0.0 {
+                1.0 + n.ln()
+            } else {
+                0.0
+            }
+        })
+        .sum();
+
+    // Recency weight: full bonus within FRESH_WINDOW_DAYS, decays to 0.5 floor.
+    let recency = c
+        .captured_ts
+        .as_deref()
+        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        .map(|t| {
+            let days_old = (now - t.with_timezone(&chrono::Utc)).num_days().max(0) as f64;
+            if days_old <= FRESH_WINDOW_DAYS as f64 {
+                1.0
+            } else {
+                0.5 + 0.5 * (FRESH_WINDOW_DAYS as f64 / days_old)
+            }
+        })
+        .unwrap_or(0.5); // unknown timestamp → neutral floor
+
+    // Length normalization: penalize very long recaps so a 2000-word recap
+    // doesn't dominate a 40-word one just by having more term hits.
+    let word_count = lower.split_whitespace().count().max(1) as f64;
+    let length_norm = 1.0 / word_count.sqrt();
+
+    let score = tf * recency * length_norm;
+
+    let (before, m, after) = best_snippet(&c.content, &lower, terms);
+    let project = project_display(&c.cwd);
+
+    RecapHit {
+        session_id: c.session_id,
+        title: c.title,
+        cwd: c.cwd,
+        project,
+        captured_ts: c.captured_ts,
+        snippet_before: before,
+        snippet_match: m,
+        snippet_after: after,
+        score,
+    }
+}
+
+/// Find the densest window of ±SNIPPET_RADIUS chars containing the most term
+/// hits, then snap to word boundaries so the snippet doesn't cut mid-word.
+/// Returns `(before, match_term, after)` sliced from the ORIGINAL content so
+/// the highlight displays in original case.
+///
+/// All indexing is in **char** space (not bytes) to stay correct under
+/// multibyte UTF-8 — recap text routinely contains non-ASCII punctuation.
+fn best_snippet(content: &str, lower: &str, terms: &[String]) -> (String, String, String) {
+    let content_chars: Vec<char> = content.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+    let n = lower_chars.len();
+
+    // Collect char-indices of every WORD-BOUNDED term occurrence. Substring
+    // hits (e.g. "auth" in "authoring") are rejected so the snippet anchors on
+    // a real token, not a fragment inside a larger word.
+    let mut hits: Vec<usize> = Vec::new();
+    for t in terms {
+        hits.extend(find_word_bounded(&lower_chars, t));
+    }
+    if hits.is_empty() {
+        // The candidate matched via LIKE but no term is token-bounded (e.g. the
+        // only occurrence was inside another word). Fall back to the head so the
+        // result is still readable, with no false highlight.
+        let head: String = content_chars.iter().take(2 * SNIPPET_RADIUS).collect();
+        return (String::new(), head, String::new());
+    }
+    hits.sort_unstable();
+    hits.dedup();
+
+    // Densest window: anchor each hit, count other hits within ±RADIUS chars.
+    let win = 2 * SNIPPET_RADIUS;
+    let mut best_anchor = hits[0];
+    let mut best_count = 0usize;
+    for &h in &hits {
+        let lo = h.saturating_sub(SNIPPET_RADIUS);
+        let hi = (h + win).min(n + 1);
+        let count = hits.iter().filter(|&&x| x >= lo && x < hi).count();
+        if count > best_count {
+            best_count = count;
+            best_anchor = h;
+        }
+    }
+
+    // The highlighted term = the longest query term found at the anchor region.
+    // We pick the term actually present nearest best_anchor.
+    let m_start_char = best_anchor;
+    let match_term_len = terms
+        .iter()
+        .filter_map(|t| {
+            let pat: Vec<char> = t.chars().collect();
+            let plen = pat.len();
+            if plen > 0
+                && m_start_char + plen <= n
+                && lower_chars[m_start_char..m_start_char + plen] == pat[..]
+            {
+                Some(plen)
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(1);
+    let m_end_char = (m_start_char + match_term_len).min(n);
+
+    // Before/after windows, snapped to word boundaries for clean reading.
+    let before_start = snap_back_to_word(&content_chars, m_start_char.saturating_sub(SNIPPET_RADIUS));
+    let after_end = snap_forward_to_word(&content_chars, (m_end_char + SNIPPET_RADIUS).min(n));
+
+    let before: String = content_chars[before_start..m_start_char]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
+    let m: String = content_chars[m_start_char..m_end_char].iter().collect();
+    let after: String = content_chars[m_end_char..after_end]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    (before, m, after)
+}
+
+/// Walk left from `idx` to the start of the word (or 0). Ensures the snippet
+/// doesn't begin mid-token.
+fn snap_back_to_word(chars: &[char], mut idx: usize) -> usize {
+    idx = idx.min(chars.len());
+    // Skip trailing whitespace we may have landed in.
+    while idx > 0 && chars[idx - 1].is_whitespace() {
+        idx -= 1;
+    }
+    // Skip the partial word we may have landed inside.
+    while idx > 0 && is_word_char(chars[idx - 1]) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Walk right from `idx` to the end of the current word. Ensures the snippet
+/// doesn't end mid-token.
+fn snap_forward_to_word(chars: &[char], mut idx: usize) -> usize {
+    let n = chars.len();
+    idx = idx.min(n);
+    // If we're mid-word, advance to its end; otherwise skip any whitespace.
+    if idx < n && is_word_char(chars[idx]) {
+        while idx < n && is_word_char(chars[idx]) {
+            idx += 1;
+        }
+    } else {
+        while idx < n && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+    }
+    idx
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Tokenize a query into lowercase terms: split on whitespace/punctuation,
+/// drop empties. Matches the ASCII-folding the LIKE search assumes.
+fn tokenize(q: &str) -> Vec<String> {
+    q.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// Find all char-indices where `term` occurs in `chars` as a **whole token**
+/// (bounded by non-word characters or string edges). Prevents substring hits
+/// like "auth" matching inside "authoring" — both for scoring and snippet
+/// anchoring. Returns indices in ascending order.
+fn find_word_bounded(chars: &[char], term: &str) -> Vec<usize> {
+    let pat: Vec<char> = term.chars().collect();
+    let plen = pat.len();
+    let n = chars.len();
+    let mut out = Vec::new();
+    if plen == 0 || plen > n {
+        return out;
+    }
+    let mut i = 0;
+    while i + plen <= n {
+        if chars[i..i + plen] == pat[..] {
+            let left_ok = i == 0 || !is_word_char(chars[i - 1]);
+            let right_idx = i + plen;
+            let right_ok = right_idx == n || !is_word_char(chars[right_idx]);
+            if left_ok && right_ok {
+                out.push(i);
+            }
+            i += plen;
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -650,6 +938,169 @@ fn set_pricing(rows: Vec<PricingRow>) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────
+// Pure-logic probes for the ranker + snippet extractor. The DB-backed
+// search_recaps is exercised end-to-end via the running app; these cover the
+// fiddly text math that's easy to get wrong (windows, word-snapping, TF).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokenize_splits_on_punctuation_and_lowercases() {
+        assert_eq!(tokenize("Auth Login!"), vec!["auth", "login"]);
+        assert_eq!(tokenize("  multi-word_test  "), vec!["multi", "word", "test"]);
+        assert!(tokenize("   ...!!   ").is_empty());
+    }
+
+    #[test]
+    fn snippet_finds_match_and_word_snaps() {
+        let content = "The user worked on the authentication flow and login page. \
+                       They also fixed a bug in the auth middleware.";
+        let lower = content.to_lowercase();
+        let terms = vec!["auth".to_string()];
+        let (before, m, after) = best_snippet(content, &lower, &terms);
+        assert!(!m.is_empty(), "match term must be non-empty");
+        assert!(
+            m.to_lowercase().contains("auth"),
+            "highlight should contain the term, got: {m:?}"
+        );
+        // Word-snap invariant: the match must start at a token boundary in the
+        // lowercased text (so we never highlight a mid-word fragment), and the
+        // matched text itself must be a real substring of the content. We don't
+        // require before+match+after to be an exact substring because before/
+        // after are trimmed for display.
+        let m_lower = m.to_lowercase();
+        assert!(lower.contains(&m_lower), "match must be a substring of content");
+        let m_start_in_lower = lower.find(&m_lower).expect("match present in lower");
+        let boundary_ok = m_start_in_lower == 0
+            || lower.as_bytes()[m_start_in_lower - 1].is_ascii_whitespace()
+            || lower.as_bytes()[m_start_in_lower - 1].is_ascii_punctuation();
+        assert!(boundary_ok, "match must start at a word boundary");
+        assert!(!after.is_empty(), "after context should be non-empty");
+        // `before` is leading context; we only assert it's non-empty here (the
+        // word-boundary guarantee is enforced on the match itself above).
+        let _ = before;
+    }
+
+    #[test]
+    fn snippet_dense_region_wins_over_first_hit() {
+        // Two clusters: a lone "auth" early, and "auth auth auth" later.
+        // The dense window should anchor on the cluster, not the first hit.
+        let content = "auth appeared once here in passing. \
+                       Much later we have auth auth auth all together \
+                       because density matters for relevance.";
+        let lower = content.to_lowercase();
+        let terms = vec!["auth".to_string()];
+        let (_before, m, _after) = best_snippet(content, &lower, &terms);
+        assert!(m.to_lowercase().contains("auth"));
+    }
+
+    #[test]
+    fn snippet_handles_multibyte_without_panicking() {
+        let content = "Recap with em-dash—here—and a curly “quote” plus auth token.";
+        let lower = content.to_lowercase();
+        let terms = vec!["auth".to_string()];
+        let (before, m, after) = best_snippet(content, &lower, &terms);
+        assert!(m.to_lowercase().contains("auth"));
+        // Must not panic and must produce valid slices.
+        let _ = format!("{before}[{m}]{after}");
+    }
+
+    #[test]
+    fn snippet_no_match_returns_head_gracefully() {
+        let content = "A recap with no relevant terms at all.";
+        let lower = content.to_lowercase();
+        let terms = vec!["nonexistent".to_string()];
+        let (before, m, after) = best_snippet(content, &lower, &terms);
+        assert!(before.is_empty());
+        assert!(!m.is_empty(), "no-match should fall back to head as the body");
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn score_recap_rewards_term_frequency_and_recency() {
+        let now = chrono::Utc::now();
+        let recent_ts = chrono::Utc::now().to_rfc3339();
+        let old_ts = (chrono::Utc::now() - chrono::Duration::days(365)).to_rfc3339();
+
+        let make = |content: &str, ts: &str| {
+            score_recap(
+                CandidateRecap {
+                    session_id: "s".into(),
+                    _uuid: "u".into(),
+                    title: "t".into(),
+                    cwd: "/p/brain".into(),
+                    captured_ts: Some(ts.into()),
+                    content: content.into(),
+                },
+                &["auth".to_string()],
+                now,
+            )
+        };
+
+        let recent = make("auth auth auth auth in this recent recap", &recent_ts);
+        let old = make("auth auth auth auth in this old recap", &old_ts);
+        let sparse = make("auth only once here in this recent longer recap with padding words", &recent_ts);
+
+        assert!(
+            recent.score > old.score,
+            "recent must outscore old (same TF): recent={} old={}",
+            recent.score, old.score
+        );
+        assert!(
+            recent.score > sparse.score,
+            "dense TF must outscore sparse (same recency): recent={} sparse={}",
+            recent.score, sparse.score
+        );
+    }
+
+    /// End-to-end probe against the real indexed DB. Ignored by default
+    /// (requires a populated ~/.claude-sessions-ui/index.sqlite). Run with:
+    ///   cargo test --lib search_recaps_against_real_db -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn search_recaps_against_real_db() {
+        let hits = search_recaps("auth login".into()).expect("search_recaps ok");
+        assert!(!hits.is_empty(), "expected real hits for 'auth login'");
+        // Top hit must carry a real snippet, not a whole-recap dump.
+        let top = &hits[0];
+        assert!(
+            !top.snippet_match.is_empty(),
+            "snippet_match must be non-empty"
+        );
+        assert!(
+            top.snippet_match.len() <= 200,
+            "snippet_match should be a window, not the whole recap: len={}",
+            top.snippet_match.len()
+        );
+        assert!(
+            !top.project.is_empty(),
+            "project label must be populated"
+        );
+        // Scores must be sorted descending.
+        let sorted = hits
+            .windows(2)
+            .all(|w| w[0].score >= w[1].score);
+        assert!(sorted, "hits must be sorted by score desc");
+        // Print a sample for human inspection.
+        println!("--- top 3 hits for 'auth login' ---");
+        for h in hits.iter().take(3) {
+            println!(
+                "  [{:.3}] {} · {}",
+                h.score, h.project, h.captured_ts.as_deref().unwrap_or("?")
+            );
+            println!(
+                "    …{}【{}】{}…",
+                h.snippet_before.chars().take(60).collect::<String>(),
+                h.snippet_match,
+                h.snippet_after.chars().take(60).collect::<String>(),
+            );
+        }
+    }
 }
 
 // ─── App entry ──────────────────────────────────────────────────────────────

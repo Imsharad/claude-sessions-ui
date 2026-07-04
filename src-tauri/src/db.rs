@@ -196,3 +196,54 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<(
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_creation_and_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // 1. Verify schema created and pricing seeded
+        let num_pricing: i64 = conn.query_row("SELECT COUNT(*) FROM pricing", [], |r| r.get(0)).unwrap();
+        assert!(num_pricing > 0, "Pricing table should be seeded");
+
+        // 2. Insert into sessions and query back
+        conn.execute(
+            "INSERT INTO sessions (id, project_dir, cwd, file_path, file_mtime, title)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["session-123", "-home-user-project", "/home/user/project", "/tmp/session.jsonl", 1000, "My Title"],
+        ).unwrap();
+
+        let title: String = conn.query_row(
+            "SELECT title FROM sessions WHERE id = ?1",
+            rusqlite::params!["session-123"],
+            |r| r.get(0)
+        ).unwrap();
+        assert_eq!(title, "My Title");
+
+        // 3. Test set_meta / get_meta
+        assert_eq!(get_meta(&conn, "some_key"), None);
+        set_meta(&conn, "some_key", "some_value").unwrap();
+        assert_eq!(get_meta(&conn, "some_key"), Some("some_value".to_string()));
+
+        // update existing meta
+        set_meta(&conn, "some_key", "new_value").unwrap();
+        assert_eq!(get_meta(&conn, "some_key"), Some("new_value".to_string()));
+
+        // 4. Test child tables (FK checks if any)
+        conn.execute(
+            "INSERT INTO recaps (session_id, uuid, content) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["session-123", "recap-uuid", "recap body"],
+        ).unwrap();
+
+        let recap_content: String = conn.query_row(
+            "SELECT content FROM recaps WHERE uuid = ?1",
+            rusqlite::params!["recap-uuid"],
+            |r| r.get(0)
+        ).unwrap();
+        assert_eq!(recap_content, "recap body");
+    }
+}

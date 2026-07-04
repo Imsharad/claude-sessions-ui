@@ -24,6 +24,9 @@ interface KanbanBoardProps {
   onSelect: (id: string) => void;
   /** Refresh sessions from App after a drag persists (onSessionsChanged). */
   onSessionsChanged?: () => void;
+  /** Board mode's detail overlay is open — reserve its width and let columns
+   *  compress so all three stay co-visible instead of clipping/scrolling. */
+  detailOpen?: boolean;
 }
 
 const COLUMNS: { id: KanbanStatus; label: string; empty: string }[] = [
@@ -40,8 +43,9 @@ function pctColumn(s: SessionCard): KanbanStatus | null {
   return "in_progress";
 }
 
-/** The column a card actually sits in: override-wins over the %-derived one. */
-function columnOf(s: SessionCard): KanbanStatus | null {
+/** The column a card actually sits in: override-wins over the %-derived one.
+ *  Exported so App can test whether a selected session has board presence. */
+export function columnOf(s: SessionCard): KanbanStatus | null {
   if (s.kanbanStatus === "planned" || s.kanbanStatus === "in_progress" || s.kanbanStatus === "completed") {
     return s.kanbanStatus;
   }
@@ -81,7 +85,7 @@ interface DropTarget {
   idx: number;
 }
 
-export function KanbanBoard({ sessions, selectedId, onSelect, onSessionsChanged }: KanbanBoardProps) {
+export function KanbanBoard({ sessions, selectedId, onSelect, onSessionsChanged, detailOpen }: KanbanBoardProps) {
   // Local mirror of props so a drop reflects instantly (optimistic); reconciled
   // when App refreshes sessions and new props flow in.
   const [items, setItems] = useState(sessions);
@@ -131,7 +135,11 @@ export function KanbanBoard({ sessions, selectedId, onSelect, onSessionsChanged 
   }
 
   return (
-    <div className="flex h-full flex-1 gap-3 overflow-x-auto bg-canvas p-4">
+    <div
+      className={`flex h-full flex-1 gap-3 overflow-x-auto bg-canvas p-4 ${
+        detailOpen ? "pr-[420px]" : ""
+      }`}
+    >
       {COLUMNS.map((c) => {
         const colCards = sortColumn(onBoard.filter((s) => columnOf(s) === c.id));
         const isDropCol = dropTarget?.col === c.id;
@@ -144,7 +152,9 @@ export function KanbanBoard({ sessions, selectedId, onSelect, onSessionsChanged 
         return (
           <div
             key={c.id}
-            className="flex min-w-[260px] flex-1 flex-col rounded-lg bg-surface-2/50"
+            className={`flex flex-1 flex-col rounded-lg bg-surface-2/50 ${
+              detailOpen ? "min-w-0" : "min-w-[260px]"
+            }`}
             onDragOver={(e) => {
               if (!draggingId) return;
               e.preventDefault();

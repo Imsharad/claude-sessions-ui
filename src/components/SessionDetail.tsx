@@ -22,6 +22,7 @@ import {
   TrendingUp,
   Wand2,
   Tags,
+  X,
 } from "lucide-react";
 import type {
   SessionDetail as SessionDetailT,
@@ -48,9 +49,11 @@ import {
 
 interface Props {
   sessionId: string | null;
+  /** When provided, a close affordance is shown (used by the board overlay). */
+  onClose?: () => void;
 }
 
-export function SessionDetail({ sessionId }: Props) {
+export function SessionDetail({ sessionId, onClose }: Props) {
   const [detail, setDetail] = useState<SessionDetailT | null>(null);
   const [resumeFork, setResumeFork] = useState(false);
   const [resuming, setResuming] = useState(false);
@@ -138,6 +141,15 @@ export function SessionDetail({ sessionId }: Props) {
               </span>
             </div>
           </div>
+          {onClose && (
+            <button
+              onClick={onClose}
+              title="Close (Esc)"
+              className="-mr-1 -mt-1 shrink-0 rounded-sm p-1.5 text-ink-3 transition hover:bg-surface-2 hover:text-ink-2"
+            >
+              <X size={15} />
+            </button>
+          )}
         </div>
 
         {/* Resume action */}

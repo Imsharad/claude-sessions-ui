@@ -16,11 +16,13 @@ pub struct ResumeArgs {
 pub fn open_in_terminal(args: ResumeArgs) -> Result<(), String> {
     // Escape the cwd for double-quoted shell. cdirs from Claude are absolute
     // paths without quotes/backslashes, but be defensive.
-    let cwd_safe = shell_escape(&args.cwd);
-    let mut cmd = format!("cd {} && claude --resume {}", cwd_safe, args.session_id);
-    if args.fork {
-        cmd.push_str(" --fork-session");
-    }
+    // ponytail: inline cmd and arg logic
+    let cmd = format!(
+        "cd {} && claude --resume {}{}",
+        shell_escape(&args.cwd),
+        args.session_id,
+        if args.fork { " --fork-session" } else { "" }
+    );
 
     // AppleScript: tell Terminal to (activate and) do the script in a new window.
     // `do script` opens a new window if Terminal has none, or a new tab/window.
@@ -36,19 +38,18 @@ pub fn open_in_terminal(args: ResumeArgs) -> Result<(), String> {
         .arg("-e")
         .arg(&script)
         .output()
-        .map_err(|e| format!("failed to spawn osascript: {}", e))?;
+        .map_err(|e| format!("failed to spawn osascript: {e}"))?;
 
+    // ponytail: combinator for shell escape, inline variable
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("osascript failed: {}", stderr.trim()));
+        return Err(format!("osascript failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
     Ok(())
 }
 
 /// Minimal shell escape: wrap in single quotes, escape any embedded single quote.
 fn shell_escape(s: &str) -> String {
-    let escaped = s.replace('\'', r"'\''");
-    format!("'{}'", escaped)
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Escape a string for embedding inside an AppleScript double-quoted string.

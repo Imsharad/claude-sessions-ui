@@ -165,21 +165,13 @@ fn file_mtime_secs(p: &Path) -> std::io::Result<i64> {
 }
 
 fn load_known_mtimes(conn: &Connection) -> HashMap<String, i64> {
-    let mut out = HashMap::new();
-    let mut stmt = match conn.prepare("SELECT file_path, file_mtime FROM sessions") {
-        Ok(s) => s,
-        Err(_) => return out,
-    };
-    let rows = match stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    }) {
-        Ok(r) => r,
-        Err(_) => return out,
-    };
-    for row in rows.flatten() {
-        out.insert(row.0, row.1);
-    }
-    out
+    // ponytail: functional row mapping
+    conn.prepare("SELECT file_path, file_mtime FROM sessions")
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+             .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
 }
 
 /// Parsed view of ~/.claude.json — only the parts we use (projects dict).
@@ -195,40 +187,26 @@ struct ProjectConfig {
 }
 
 fn load_claude_json() -> ClaudeConfig {
-    let path = claude_json_path();
-    let mut projects = HashMap::new();
-    let bytes = match fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => {
-            return ClaudeConfig { projects };
-        }
-    };
-    let v: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => return ClaudeConfig { projects },
-    };
+    // ponytail: combinators and early returns
+    let Ok(bytes) = fs::read(claude_json_path()) else { return ClaudeConfig { projects: HashMap::new() } };
+    let Ok(v) = serde_json::from_slice::<Value>(&bytes) else { return ClaudeConfig { projects: HashMap::new() } };
     let Some(projs) = v.get("projects").and_then(|p| p.as_object()) else {
-        return ClaudeConfig { projects };
+        return ClaudeConfig { projects: HashMap::new() };
     };
-    for (cwd, cfg) in projs {
-        projects.insert(
-            cwd.clone(),
+
+    let projects = projs.iter().map(|(cwd, cfg)| {
+        (cwd.clone(),
             ProjectConfig {
                 last_cost_usd: cfg.get("lastCost").and_then(|c| c.as_f64()),
                 last_model_usage: cfg.get("lastModelUsage").cloned(),
-                last_lines_added: cfg
-                    .get("lastLinesAdded")
-                    .and_then(|c| c.as_i64()),
-                last_lines_removed: cfg
-                    .get("lastLinesRemoved")
-                    .and_then(|c| c.as_i64()),
-                last_session_id: cfg
-                    .get("lastSessionId")
+                last_lines_added: cfg.get("lastLinesAdded").and_then(|c| c.as_i64()),
+                last_lines_removed: cfg.get("lastLinesRemoved").and_then(|c| c.as_i64()),
+                last_session_id: cfg.get("lastSessionId")
                     .and_then(|c| c.as_str())
                     .map(|s| s.to_string()),
-            },
-        );
-    }
+            }
+        )
+    }).collect();
     ClaudeConfig { projects }
 }
 
@@ -296,22 +274,10 @@ fn parse_and_upsert(
             Err(_) => continue, // torn line; tolerate
         };
 
-        // sessionId is on almost every line; grab it once.
-        if session_id.is_none() {
-            if let Some(s) = v.get("sessionId").and_then(|s| s.as_str()) {
-                session_id = Some(s.to_string());
-            }
-        }
-        if cwd.is_none() {
-            if let Some(s) = v.get("cwd").and_then(|s| s.as_str()) {
-                cwd = Some(s.to_string());
-            }
-        }
-        if git_branch.is_none() {
-            if let Some(s) = v.get("gitBranch").and_then(|s| s.as_str()) {
-                git_branch = Some(s.to_string());
-            }
-        }
+        // ponytail: lazy assignment
+        if session_id.is_none() { session_id = v.get("sessionId").and_then(|s| s.as_str()).map(String::from); }
+        if cwd.is_none() { cwd = v.get("cwd").and_then(|s| s.as_str()).map(String::from); }
+        if git_branch.is_none() { git_branch = v.get("gitBranch").and_then(|s| s.as_str()).map(String::from); }
 
         let ts = v.get("timestamp").and_then(|s| s.as_str()).map(|s| s.to_string());
         if let Some(ref t) = ts {
@@ -377,20 +343,17 @@ fn parse_and_upsert(
                 }
             }
             "ai-title" => {
-                if title.is_none() {
-                    title = v.get("aiTitle").and_then(|s| s.as_str()).map(|s| s.to_string());
-                }
+                if title.is_none() { title = v.get("aiTitle").and_then(|s| s.as_str()).map(String::from); }
             }
             "last-prompt" => {
+                // ponytail: last occurrence wins, no need for is_none check
                 if let Some(s) = v.get("lastPrompt").and_then(|s| s.as_str()) {
                     last_prompt = Some(s.to_string());
                 }
             }
             "permission-mode" => {
-                if let Some(s) = v.get("permissionMode").and_then(|s| s.as_str()) {
-                    if s == "plan" {
-                        plan_mode = true;
-                    }
+                if v.get("permissionMode").and_then(|s| s.as_str()) == Some("plan") {
+                    plan_mode = true;
                 }
             }
             "system" => {

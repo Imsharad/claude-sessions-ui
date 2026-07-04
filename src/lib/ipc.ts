@@ -160,6 +160,13 @@ export interface PricingRow {
   cacheReadPerMtok: number;
 }
 
+export interface BlacklistEntry {
+  pattern: string;
+  createdAt: string | null;
+  /** Live count of indexed sessions this pattern currently hides. */
+  matchCount: number;
+}
+
 // ─── Command wrappers ──────────────────────────────────────────────────
 // Each mirrors a #[tauri::command] in lib.rs. Args are passed as-is; Rust
 // deserializes with the same camelCase convention.
@@ -196,3 +203,13 @@ export const getPricing = (): Promise<PricingRow[]> =>
 
 export const setPricing = (rows: PricingRow[]): Promise<void> =>
   call<void>("set_pricing", { rows });
+
+// Mutators return the refreshed list so the UI updates in one round-trip.
+export const listBlacklist = (): Promise<BlacklistEntry[]> =>
+  call<BlacklistEntry[]>("list_blacklist");
+
+export const addBlacklistPattern = (pattern: string): Promise<BlacklistEntry[]> =>
+  call<BlacklistEntry[]>("add_blacklist_pattern", { pattern });
+
+export const removeBlacklistPattern = (pattern: string): Promise<BlacklistEntry[]> =>
+  call<BlacklistEntry[]>("remove_blacklist_pattern", { pattern });

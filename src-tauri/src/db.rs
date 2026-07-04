@@ -146,6 +146,71 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
     // Seed pricing defaults once. UPDATE OR INSERT pattern via temp absence check.
     seed_pricing_if_empty(conn)?;
+    migrate_v1(conn)?;
+    Ok(())
+}
+
+/// v1: tag-and-triage schema. Establishes the PRAGMA user_version pattern —
+/// additive steps run once, guarded by the version, then bump it. Columns are
+/// double-guarded by a presence check so an interrupted run stays idempotent.
+///
+/// Lands the FULL cross-feature schema in one step: blacklist (F1), tag fields
+/// (F3, read by F2's chips), kanban placement (F4). All tag/kanban columns are
+/// nullable — null means "untagged", which the UI renders as clean absence.
+fn migrate_v1(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 1 {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_blacklist (
+            pattern    TEXT PRIMARY KEY,   -- dir name or path, optional /** suffix
+            created_at TEXT
+        );",
+    )?;
+    // Seed inside the version gate: runs once ever, so deleting it sticks.
+    conn.execute(
+        "INSERT OR IGNORE INTO project_blacklist (pattern, created_at) VALUES (?1, ?2)",
+        rusqlite::params!["udacity-project-reviews/**", chrono::Utc::now().to_rfc3339()],
+    )?;
+
+    for (name, decl) in [
+        // F3 tag fields (F2 chips read these; absent = null = renders nothing)
+        ("area_of_life", "area_of_life TEXT"),
+        ("project_short_name", "project_short_name TEXT"),
+        ("goal_completed", "goal_completed INTEGER"),
+        ("completion_pct", "completion_pct INTEGER"),
+        ("tag_rationale", "tag_rationale TEXT"),
+        ("tagged_at", "tagged_at TEXT"),
+        ("manual_fields", "manual_fields TEXT"), // JSON array of hand-edited field names
+        // F4 board placement (override-wins vs %-derived column)
+        ("kanban_status", "kanban_status TEXT"),
+        ("kanban_order", "kanban_order REAL"),
+    ] {
+        add_column_if_missing(conn, "sessions", name, decl)?;
+    }
+
+    conn.pragma_update(None, "user_version", 1)?;
+    Ok(())
+}
+
+/// SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS — check table_info first.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .flatten()
+        .any(|c| c == column);
+    drop(stmt);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))?;
+    }
     Ok(())
 }
 
@@ -174,6 +239,17 @@ fn seed_pricing_if_empty(conn: &Connection) -> rusqlite::Result<()> {
         stmt.execute(rusqlite::params![m, i, o, cw, cr])?;
     }
     Ok(())
+}
+
+/// All blacklist patterns, oldest first. Missing table (pre-v1 test DBs)
+/// degrades to "no blacklist" rather than an error.
+pub fn load_blacklist_patterns(conn: &Connection) -> Vec<String> {
+    conn.prepare("SELECT pattern FROM project_blacklist ORDER BY created_at")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
 }
 
 /// Read a meta value (e.g. "last_full_scan_ts").
@@ -244,5 +320,41 @@ mod tests {
             |r| r.get(0)
         ).unwrap();
         assert_eq!(recap_content, "recap body");
+    }
+
+    #[test]
+    fn migrate_v1_lands_schema_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // user_version bumped
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 1);
+
+        // Blacklist table exists and is seeded exactly once
+        let patterns = load_blacklist_patterns(&conn);
+        assert_eq!(patterns, vec!["udacity-project-reviews/**".to_string()]);
+
+        // All new sessions columns exist and are nullable (insert without them)
+        conn.execute(
+            "INSERT INTO sessions (id, file_path, file_mtime) VALUES ('s1', '/tmp/x.jsonl', 1)",
+            [],
+        ).unwrap();
+        let (area, pct, kanban): (Option<String>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT area_of_life, completion_pct, kanban_status FROM sessions WHERE id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(area, None);
+        assert_eq!(pct, None);
+        assert_eq!(kanban, None);
+
+        // Re-running migrate is a no-op (idempotent) and does NOT re-seed:
+        // deleting the seed must stick.
+        conn.execute("DELETE FROM project_blacklist", []).unwrap();
+        migrate(&conn).unwrap();
+        assert!(load_blacklist_patterns(&conn).is_empty(), "seed must not reappear");
     }
 }

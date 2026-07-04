@@ -56,6 +56,21 @@ describe('session selection', () => {
   });
 });
 
+describe('hidden projects (blacklist)', () => {
+  it('exposes a quiet control that reveals the manage panel', async () => {
+    const control = await $('[title="Hidden projects"]');
+    await control.waitForExist({ timeout: 10000 });
+    await control.click();
+    // Panel reveals: the add-pattern input is always present when open (and with
+    // zero patterns the warm guidance line shows instead of a dead zone).
+    await browser.waitUntil(
+      async () => (await $('[placeholder="e.g. project-name/**"]')).isExisting(),
+      { timeout: 10000, timeoutMsg: 'blacklist panel did not reveal its add-pattern input' },
+    );
+    await expect($('[placeholder="e.g. project-name/**"]')).toBeExisting();
+  });
+});
+
 describe('backend', () => {
   it('has a live Tauri IPC bridge (Rust backend reachable)', async () => {
     const ok = await browser.execute(() => typeof window.__TAURI_INTERNALS__ !== 'undefined');

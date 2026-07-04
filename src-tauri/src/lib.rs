@@ -195,6 +195,15 @@ pub struct PricingRow {
     pub cache_read_per_mtok: f64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BlacklistEntry {
+    pub pattern: String,
+    pub created_at: Option<String>,
+    /// Live count of indexed sessions this pattern currently hides.
+    pub match_count: i64,
+}
+
 // ─── Commands ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -271,12 +280,16 @@ fn list_sessions(filter: Option<SessionFilter>) -> Result<Vec<SessionCard>, Stri
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     // ponytail: iter over dynamic params, functional collect
-    let out: Result<Vec<SessionCard>, String> = stmt
+    let mut out: Vec<SessionCard> = stmt
         .query_map(rusqlite::params_from_iter(binds), map_session_card)
         .map_err(|e| e.to_string())?
         .map(|r| r.map_err(|e| e.to_string()))
-        .collect();
-    out
+        .collect::<Result<_, _>>()?;
+    // Defensive filter: drop blacklisted trees still lingering in the DB so a
+    // just-added pattern takes effect this query cycle, no re-index needed.
+    let patterns = db::load_blacklist_patterns(&conn);
+    out.retain(|c| !dir_blacklisted(&c.cwd, &c.project_dir, &patterns));
+    Ok(out)
 }
 
 fn map_session_card(r: &rusqlite::Row) -> rusqlite::Result<SessionCard> {
@@ -307,6 +320,100 @@ fn map_session_card(r: &rusqlite::Row) -> rusqlite::Result<SessionCard> {
 
 fn project_display(cwd: &str) -> String {
     cwd.split('/').next_back().unwrap_or(cwd).to_string()
+}
+
+// ─── Blacklist: defensive query-path filter + live match counts ──────────────
+// The indexer skips blacklisted trees at scan time; these apply the *second*
+// enforcement point so a pattern added after indexing (or one whose rows still
+// linger) drops those sessions from every query, and un-blacklisting re-surfaces
+// them without a wipe. Both checks run — real cwd path AND encoded project_dir —
+// because a hyphenated project name is only unambiguous in encoded space.
+
+/// True when a session's `cwd` or encoded `project_dir` matches ANY pattern.
+/// The one predicate the three query paths filter on, so each stays a one-liner.
+fn dir_blacklisted(cwd: &str, project_dir: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|p| indexer::is_blacklisted(cwd, p) || indexer::is_blacklisted_encoded(project_dir, p))
+}
+
+/// Sessions a SINGLE pattern currently hides — computed in Rust over the
+/// (cwd, project_dir) pairs, not a SQL glob, so it matches the indexer exactly.
+fn count_matches(pairs: &[(String, String)], pattern: &str) -> i64 {
+    pairs
+        .iter()
+        .filter(|(cwd, pd)| {
+            indexer::is_blacklisted(cwd, pattern) || indexer::is_blacklisted_encoded(pd, pattern)
+        })
+        .count() as i64
+}
+
+/// All (cwd, project_dir) pairs — cheap for a ~700-row dataset. Backs both the
+/// match counts and the defensive filter.
+fn load_session_dirs(conn: &rusqlite::Connection) -> Vec<(String, String)> {
+    conn.prepare("SELECT cwd, project_dir FROM sessions")
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Build the blacklist list with a live match count per pattern. Shared by the
+/// list command and the two mutators (which return the refreshed list).
+fn blacklist_entries(conn: &rusqlite::Connection) -> Result<Vec<BlacklistEntry>, String> {
+    let pairs = load_session_dirs(conn);
+    let mut stmt = conn
+        .prepare("SELECT pattern, created_at FROM project_blacklist ORDER BY created_at")
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows
+        .into_iter()
+        .map(|(pattern, created_at)| {
+            let match_count = count_matches(&pairs, &pattern);
+            BlacklistEntry {
+                pattern,
+                created_at,
+                match_count,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn list_blacklist() -> Result<Vec<BlacklistEntry>, String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    blacklist_entries(&conn)
+}
+
+#[tauri::command]
+fn add_blacklist_pattern(pattern: String) -> Result<Vec<BlacklistEntry>, String> {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return Err("Enter a pattern to hide a project.".to_string());
+    }
+    let conn = db::open().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR IGNORE INTO project_blacklist (pattern, created_at) VALUES (?1, ?2)",
+        params![p, chrono::Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    blacklist_entries(&conn)
+}
+
+#[tauri::command]
+fn remove_blacklist_pattern(pattern: String) -> Result<Vec<BlacklistEntry>, String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM project_blacklist WHERE pattern = ?1",
+        params![pattern.trim()],
+    )
+    .map_err(|e| e.to_string())?;
+    blacklist_entries(&conn)
 }
 
 #[tauri::command]
@@ -452,7 +559,7 @@ fn search_recaps(query: String) -> Result<Vec<RecapHit>, String> {
     // a map so the ranker sees the whole recap, not a per-term fragment.
     let mut stmt = conn
         .prepare(
-            "SELECT r.session_id, r.uuid, s.title, s.cwd, r.captured_ts, r.content
+            "SELECT r.session_id, r.uuid, s.title, s.cwd, r.captured_ts, r.content, s.project_dir
              FROM recaps r
              JOIN sessions s ON s.id = r.session_id
              WHERE r.content LIKE ?1",
@@ -472,6 +579,7 @@ fn search_recaps(query: String) -> Result<Vec<RecapHit>, String> {
                     cwd: r.get(3)?,
                     captured_ts: r.get::<_, Option<String>>(4)?,
                     content: r.get(5)?,
+                    project_dir: r.get(6)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -489,10 +597,13 @@ fn search_recaps(query: String) -> Result<Vec<RecapHit>, String> {
     }
     drop(stmt);
 
-    // Score + extract snippet, then rank.
+    // Score + extract snippet, then rank. Defensive blacklist filter first, so
+    // hidden trees never appear in search even if their rows still exist.
+    let patterns = db::load_blacklist_patterns(&conn);
     let now = chrono::Utc::now();
     let mut scored: Vec<RecapHit> = seen
         .into_values()
+        .filter(|c| !dir_blacklisted(&c.cwd, &c.project_dir, &patterns))
         .map(|c| score_recap(c, &terms, now))
         .collect();
     // Primary: score desc. Tiebreak: most recent first.
@@ -525,6 +636,8 @@ struct CandidateRecap {
     cwd: String,
     captured_ts: Option<String>,
     content: String,
+    /// Encoded project dir, read only for the defensive blacklist filter.
+    project_dir: String,
 }
 
 /// Score a recap against the query terms and extract the best snippet window.
@@ -755,7 +868,7 @@ fn digest(days: Option<i64>) -> Result<Vec<DigestDay>, String> {
         .prepare(&format!(
             "SELECT s.id, s.title, s.cwd, s.last_ts,
                     (SELECT content FROM recaps r WHERE r.session_id = s.id AND r.is_final = 1),
-                    s.message_count
+                    s.message_count, s.project_dir
              FROM sessions s
              WHERE s.last_ts >= datetime('now', '-{} days')
              ORDER BY s.last_ts DESC",
@@ -765,6 +878,7 @@ fn digest(days: Option<i64>) -> Result<Vec<DigestDay>, String> {
     let rows = stmt
         .query_map([], |r| {
             let cwd: String = r.get(2)?;
+            let project_dir: String = r.get(6)?;
             let last_ts: Option<String> = r.get(3)?;
             let day = last_ts
                 .as_deref()
@@ -780,18 +894,23 @@ fn digest(days: Option<i64>) -> Result<Vec<DigestDay>, String> {
                 recap: r.get(4)?,
                 message_count: r.get(5)?,
             })
-            .map(|e| (day, e))
+            .map(|e| (day, project_dir, e))
         })
         .map_err(|e| e.to_string())?;
 
+    // Defensive filter: same dual check as the indexer / list_sessions.
+    let patterns = db::load_blacklist_patterns(&conn);
     let mut by_day: Vec<DigestDay> = Vec::new();
-    for r in rows.flatten() {
-        if by_day.last().map(|d| d.day == r.0).unwrap_or(false) {
-            by_day.last_mut().unwrap().sessions.push(r.1);
+    for (day, project_dir, entry) in rows.flatten() {
+        if dir_blacklisted(&entry.cwd, &project_dir, &patterns) {
+            continue;
+        }
+        if by_day.last().map(|d| d.day == day).unwrap_or(false) {
+            by_day.last_mut().unwrap().sessions.push(entry);
         } else {
             by_day.push(DigestDay {
-                day: r.0,
-                sessions: vec![r.1],
+                day,
+                sessions: vec![entry],
             });
         }
     }
@@ -936,6 +1055,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dir_blacklisted_and_count_match_indexer_dual_check() {
+        // Mixed dataset: two rows under a blacklisted tree (one matched by cwd,
+        // one only unambiguous in encoded space), plus an innocent sibling.
+        let pairs = vec![
+            (
+                "/Users/s/Projects/udacity-project-reviews".to_string(),
+                "-Users-s-Projects-udacity-project-reviews".to_string(),
+            ),
+            (
+                "/Users/s/Projects/udacity-project-reviews/sub".to_string(),
+                "-Users-s-Projects-udacity-project-reviews-sub".to_string(),
+            ),
+            (
+                "/Users/s/Projects/brain".to_string(),
+                "-Users-s-Projects-brain".to_string(),
+            ),
+        ];
+        let patterns = vec!["udacity-project-reviews/**".to_string()];
+
+        // Predicate: parent + descendant hidden, sibling kept.
+        assert!(dir_blacklisted(&pairs[0].0, &pairs[0].1, &patterns));
+        assert!(dir_blacklisted(&pairs[1].0, &pairs[1].1, &patterns));
+        assert!(!dir_blacklisted(&pairs[2].0, &pairs[2].1, &patterns));
+
+        // Count: exactly the two hidden rows.
+        assert_eq!(count_matches(&pairs, "udacity-project-reviews/**"), 2);
+        assert_eq!(count_matches(&pairs, "brain"), 1);
+        assert_eq!(count_matches(&pairs, "nonexistent"), 0);
+        // Empty pattern list hides nothing.
+        assert!(!dir_blacklisted(&pairs[0].0, &pairs[0].1, &[]));
+    }
+
+    #[test]
     fn tokenize_splits_on_punctuation_and_lowercases() {
         assert_eq!(tokenize("Auth Login!"), vec!["auth", "login"]);
         assert_eq!(tokenize("  multi-word_test  "), vec!["multi", "word", "test"]);
@@ -1022,6 +1174,7 @@ mod tests {
                     cwd: "/p/brain".into(),
                     captured_ts: Some(ts.into()),
                     content: content.into(),
+                    project_dir: "-p-brain".into(),
                 },
                 &["auth".to_string()],
                 now,
@@ -1117,6 +1270,9 @@ pub fn run() {
             toggle_pin,
             get_pricing,
             set_pricing,
+            list_blacklist,
+            add_blacklist_pattern,
+            remove_blacklist_pattern,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -89,6 +89,7 @@ export default function App() {
               query={query}
               onQueryChange={setQuery}
               onPinnedChange={refresh}
+              onBlacklistChange={refresh}
             />
             <SessionList
               sessions={visibleSessions}

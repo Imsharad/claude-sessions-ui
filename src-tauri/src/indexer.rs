@@ -72,6 +72,11 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
     // Load config once: gives us per-project cost/lines data for the projects table.
     let config = load_claude_json();
 
+    // Blacklisted project trees never enter the DB as tracked. Rows already
+    // indexed are left alone — un-blacklisting re-surfaces them without a wipe
+    // (the query paths in lib.rs are the second enforcement point).
+    let blacklist = crate::db::load_blacklist_patterns(conn);
+
     let mut files_seen = 0usize;
     let mut files_reindexed = 0usize;
     let mut files_skipped = 0usize;
@@ -99,6 +104,13 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
     {
         files_seen += 1;
         let path = entry.path();
+        let encoded_dir = path
+            .parent()
+            .and_then(|p| p.file_name().and_then(|s| s.to_str()))
+            .unwrap_or("");
+        if blacklist.iter().any(|p| is_blacklisted_encoded(encoded_dir, p)) {
+            continue;
+        }
         let mtime = match file_mtime_secs(path) {
             Ok(m) => m,
             Err(e) => {
@@ -208,6 +220,37 @@ fn load_claude_json() -> ClaudeConfig {
         )
     }).collect();
     ClaudeConfig { projects }
+}
+
+// ─── Blacklist matching ─────────────────────────────────────────────────────
+// A pattern names a directory (relative like "udacity-project-reviews" or
+// absolute), with an optional "/**" suffix; either way it matches that dir AND
+// all descendants. Matching is segment-bounded so "brain" never hits "brainstorm".
+//
+// Two spaces to match in: real cwd paths use '/' separators; the encoded
+// project dir name uses '-' (Claude Code encodes cwd by replacing '/' with '-',
+// so a hyphenated project name is only unambiguous in encoded space).
+
+/// Does a real cwd path (e.g. "/Users/x/Projects/foo") fall under `pattern`?
+pub fn is_blacklisted(cwd: &str, pattern: &str) -> bool {
+    let base = pattern.trim_end_matches("/**").trim_end_matches('/');
+    !base.is_empty() && segment_match(cwd, base, '/')
+}
+
+/// Does an encoded project dir (e.g. "-Users-x-Projects-foo-bar") fall under
+/// `pattern`? Pattern separators are translated to encoded space first.
+pub fn is_blacklisted_encoded(encoded_dir: &str, pattern: &str) -> bool {
+    let base = pattern.trim_end_matches("/**").trim_end_matches('/').replace('/', "-");
+    !base.is_empty() && segment_match(encoded_dir, &base, '-')
+}
+
+/// True when `base` appears in `hay` bounded by `sep` (or string edges) —
+/// i.e. `hay` IS base, starts with base/, ends with /base, or contains /base/.
+fn segment_match(hay: &str, base: &str, sep: char) -> bool {
+    hay == base
+        || hay.starts_with(&format!("{base}{sep}"))
+        || hay.ends_with(&format!("{sep}{base}"))
+        || hay.contains(&format!("{sep}{base}{sep}"))
 }
 
 /// The encoded dir name (e.g. "-Users-sharad-...") → decoded cwd path.
@@ -853,6 +896,33 @@ mod tests {
             rusqlite::params!["test-model", 10.0, 20.0, 0.0, 0.0],
         ).unwrap();
         conn
+    }
+
+    #[test]
+    fn blacklist_matches_parent_and_descendants() {
+        let p = "udacity-project-reviews/**";
+        assert!(is_blacklisted("/Users/s/Projects/udacity-project-reviews", p));
+        assert!(is_blacklisted("/Users/s/Projects/udacity-project-reviews/sub/dir", p));
+        assert!(!is_blacklisted("/Users/s/Projects/udacity-project-reviews-fork", p));
+        assert!(!is_blacklisted("/Users/s/Projects/other", p));
+        // plain pattern (no /**) has the same dir-and-descendants semantics
+        assert!(is_blacklisted("/Users/s/Projects/brain/sub", "brain"));
+        assert!(!is_blacklisted("/Users/s/Projects/brainstorm", "brain"));
+        // absolute pattern
+        assert!(is_blacklisted("/Users/s/Projects/brain", "/Users/s/Projects/brain/**"));
+        assert!(!is_blacklisted("/Users/s/Projects", "/Users/s/Projects/brain/**"));
+    }
+
+    #[test]
+    fn blacklist_matches_encoded_dirs() {
+        let p = "udacity-project-reviews/**";
+        assert!(is_blacklisted_encoded("-Users-s-Projects-udacity-project-reviews", p));
+        assert!(is_blacklisted_encoded("-Users-s-Projects-udacity-project-reviews-sub", p));
+        // NOT a false positive on a sibling that merely shares the prefix chars
+        assert!(!is_blacklisted_encoded("-Users-s-Projects-udacity-project-reviewsx", p));
+        // pattern with a path gets its '/' translated to encoded '-'
+        assert!(is_blacklisted_encoded("-Users-s-NOW-brain", "NOW/brain/**"));
+        assert!(!is_blacklisted_encoded("-Users-s-THEN-brain", "NOW/brain/**"));
     }
 
     #[test]

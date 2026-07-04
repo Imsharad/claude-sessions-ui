@@ -8,10 +8,16 @@
  * Selection drives the SessionList filter. Pinning persists via the
  * toggle_pin command (writes through to SQLite).
  */
-import { useState } from "react";
-import { Search, Star, Folder, Hash } from "lucide-react";
-import type { SessionCard } from "../lib/ipc";
-import { togglePin } from "../lib/ipc";
+import { useEffect, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { Search, Star, Folder, Hash, EyeOff, X, Plus } from "lucide-react";
+import type { SessionCard, BlacklistEntry } from "../lib/ipc";
+import {
+  togglePin,
+  listBlacklist,
+  addBlacklistPattern,
+  removeBlacklistPattern,
+} from "../lib/ipc";
 import { shortCwd } from "../lib/format";
 
 interface ProjectGroup {
@@ -30,6 +36,7 @@ interface SidebarProps {
   query: string;
   onQueryChange: (q: string) => void;
   onPinnedChange: () => void; // refresh after pin toggle
+  onBlacklistChange: () => void; // refresh sessions after a hide/unhide
 }
 
 export function Sidebar({
@@ -39,8 +46,41 @@ export function Sidebar({
   query,
   onQueryChange,
   onPinnedChange,
+  onBlacklistChange,
 }: SidebarProps) {
   const [showAll, setShowAll] = useState(false);
+
+  // Hidden-projects (blacklist) manage panel. Loaded once so the count reads
+  // from launch; mutators return the refreshed list in one round-trip.
+  const [showHidden, setShowHidden] = useState(false);
+  const [blacklist, setBlacklist] = useState<BlacklistEntry[]>([]);
+  const [newPattern, setNewPattern] = useState("");
+  const [hiddenError, setHiddenError] = useState<string | null>(null);
+
+  useEffect(() => {
+    listBlacklist().then(setBlacklist).catch((e) => console.error("blacklist load failed", e));
+  }, []);
+
+  const handleAddHidden = async () => {
+    try {
+      setBlacklist(await addBlacklistPattern(newPattern));
+      setNewPattern("");
+      setHiddenError(null);
+      onBlacklistChange();
+    } catch (e) {
+      setHiddenError(String(e));
+    }
+  };
+
+  const handleRemoveHidden = async (pattern: string) => {
+    try {
+      setBlacklist(await removeBlacklistPattern(pattern));
+      setHiddenError(null);
+      onBlacklistChange();
+    } catch (e) {
+      setHiddenError(String(e));
+    }
+  };
 
   // ponytail: Drop useMemo, computing groups is fast enough for <1000 items
   const map = new Map<string, ProjectGroup>();
@@ -104,6 +144,90 @@ export function Sidebar({
         )}
         {others.length === 0 && pinned.length === 0 && <p className="px-3 py-2 text-[12px] text-ink-4">No projects indexed.</p>}
       </nav>
+
+      <div className="border-t border-border px-2 py-2">
+        <AnimatePresence initial={false}>
+          {showHidden && (
+            <motion.div
+              key="hidden-panel"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: "auto" }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ type: "spring", stiffness: 400, damping: 30 }}
+              className="overflow-hidden"
+            >
+              <div className="pb-2 pt-1">
+                {blacklist.length === 0 ? (
+                  <p className="px-3 py-1.5 text-[11.5px] leading-snug text-ink-4">
+                    Add a pattern to hide a project tree from tracking.
+                  </p>
+                ) : (
+                  blacklist.map((b) => (
+                    <div
+                      key={b.pattern}
+                      className="group flex items-center gap-2 rounded-sm px-3 py-1 text-ink-2 transition hover:bg-surface-3"
+                    >
+                      <span className="min-w-0 flex-1 truncate font-mono text-[11px]" title={b.pattern}>
+                        {b.pattern}
+                      </span>
+                      <span className="text-[11px] tabular-nums text-ink-4" title="Sessions hidden">
+                        {b.matchCount}
+                      </span>
+                      <button
+                        onClick={() => handleRemoveHidden(b.pattern)}
+                        className="opacity-0 transition group-hover:opacity-100"
+                        title="Stop hiding this project"
+                      >
+                        <X size={12} className="text-ink-4 hover:text-danger" />
+                      </button>
+                    </div>
+                  ))
+                )}
+
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    handleAddHidden();
+                  }}
+                  className="mt-1.5 flex items-center gap-1.5 px-2"
+                >
+                  <input
+                    value={newPattern}
+                    onChange={(e) => setNewPattern(e.target.value)}
+                    placeholder="e.g. project-name/**"
+                    className="min-w-0 flex-1 rounded border border-border bg-surface px-2 py-1 text-[11.5px] text-ink placeholder:text-ink-4 shadow-xs transition focus:border-accent focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    className="shrink-0 rounded-sm p-1 text-ink-3 transition hover:bg-surface-3 hover:text-ink-2"
+                    title="Hide project"
+                  >
+                    <Plus size={14} />
+                  </button>
+                </form>
+
+                {hiddenError && (
+                  <p className="mt-1 px-3 text-[11px] text-danger">{hiddenError}</p>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <button
+          onClick={() => setShowHidden((v) => !v)}
+          title="Hidden projects"
+          className={`flex w-full items-center gap-2 rounded-sm px-3 py-1.5 text-[13px] transition hover:bg-surface-3 ${
+            showHidden ? "text-ink-2" : "text-ink-3 hover:text-ink-2"
+          }`}
+        >
+          <EyeOff size={14} className="text-ink-3" />
+          <span className="flex-1 text-left font-medium">Hidden projects</span>
+          {blacklist.length > 0 && (
+            <span className="text-[11px] tabular-nums text-ink-4">{blacklist.length}</span>
+          )}
+        </button>
+      </div>
     </aside>
   );
 }

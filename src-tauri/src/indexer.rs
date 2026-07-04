@@ -779,3 +779,225 @@ fn parse_iso(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .ok()
         .map(|d| d.with_timezone(&chrono::Utc))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    use std::io::Write;
+
+    fn setup_mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        // create tables
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS sessions (
+                id            TEXT PRIMARY KEY,
+                project_dir   TEXT,
+                cwd           TEXT,
+                git_branch    TEXT,
+                title         TEXT,
+                first_ts      TEXT,
+                last_ts       TEXT,
+                message_count INTEGER DEFAULT 0,
+                duration_ms   INTEGER DEFAULT 0,
+                plan_mode     INTEGER DEFAULT 0,
+                has_recap     INTEGER DEFAULT 0,
+                file_size     INTEGER DEFAULT 0,
+                file_path     TEXT UNIQUE NOT NULL,
+                file_mtime    INTEGER NOT NULL,
+                indexed_at    TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS session_usage (
+                session_id          TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                model               TEXT NOT NULL,
+                input_toks          INTEGER DEFAULT 0,
+                output_toks         INTEGER DEFAULT 0,
+                cache_create_toks   INTEGER DEFAULT 0,
+                cache_read_toks     INTEGER DEFAULT 0,
+                cost_usd            REAL    DEFAULT 0,
+                cost_source         TEXT,
+                api_duration_ms     INTEGER DEFAULT 0,
+                PRIMARY KEY (session_id, model)
+            );
+
+            CREATE TABLE IF NOT EXISTS recaps (
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                uuid         TEXT PRIMARY KEY,
+                captured_ts  TEXT,
+                content      TEXT,
+                seq          INTEGER,
+                is_final     INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS files_touched (
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                file_path   TEXT NOT NULL,
+                snapshots   INTEGER DEFAULT 0,
+                PRIMARY KEY (session_id, file_path)
+            );
+
+            CREATE TABLE IF NOT EXISTS todos (
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq         INTEGER NOT NULL,
+                content     TEXT,
+                status      TEXT,
+                PRIMARY KEY (session_id, seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS turns (
+                session_id   TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                turn_idx     INTEGER NOT NULL,
+                duration_ms  INTEGER,
+                message_count INTEGER,
+                PRIMARY KEY (session_id, turn_idx)
+            );
+
+            CREATE TABLE IF NOT EXISTS errors (
+                session_id     TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq            INTEGER NOT NULL,
+                kind           TEXT,
+                retry_attempt  INTEGER,
+                retry_in_ms    INTEGER,
+                PRIMARY KEY (session_id, seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS projects (
+                encoded_dir        TEXT PRIMARY KEY,
+                cwd                TEXT,
+                display_name       TEXT,
+                session_count      INTEGER DEFAULT 0,
+                last_cost_usd      REAL,
+                last_lines_added   INTEGER,
+                last_lines_removed INTEGER,
+                last_modified      TEXT,
+                pinned             INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS pricing (
+                model                TEXT PRIMARY KEY,
+                input_per_mtok       REAL,
+                output_per_mtok      REAL,
+                cache_write_per_mtok REAL,
+                cache_read_per_mtok  REAL
+            );
+            "#,
+        ).unwrap();
+        // Insert a dummy price for tests
+        conn.execute(
+            "INSERT INTO pricing (model, input_per_mtok, output_per_mtok, cache_write_per_mtok, cache_read_per_mtok) VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params!["test-model", 10.0, 20.0, 0.0, 0.0],
+        ).unwrap();
+        conn
+    }
+
+    #[test]
+    fn decode_dir() {
+        assert_eq!(decode_project_dir("-home-test"), "/home/test");
+        assert_eq!(decode_project_dir("a-b-c"), "a/b/c");
+    }
+
+    #[test]
+    fn test_sanitize_title() {
+        assert_eq!(sanitize_title("## Task: do X").unwrap(), "Task: do X");
+        assert_eq!(sanitize_title("<instructions><references>Hello</references>").unwrap(), "Hello");
+        assert_eq!(sanitize_title("@/src/foo.rs").unwrap(), "src/foo.rs");
+        assert_eq!(sanitize_title("    _test_  ").unwrap(), "test");
+        assert!(sanitize_title("<tag></tag>").is_none());
+    }
+
+    #[test]
+    fn parse_and_upsert_empty_file() {
+        let conn = setup_mem_db();
+        let f = NamedTempFile::new().unwrap();
+        let cfg = ClaudeConfig { projects: HashMap::new() };
+        let res = parse_and_upsert(&conn, f.path(), 1234, &cfg).unwrap();
+        assert_eq!(res, false, "empty file should return false");
+    }
+
+    #[test]
+    fn parse_and_upsert_no_session_id() {
+        let conn = setup_mem_db();
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"type":"user","message":{{"content":"hi"}}}}"#).unwrap();
+        let cfg = ClaudeConfig { projects: HashMap::new() };
+        let res = parse_and_upsert(&conn, f.path(), 1234, &cfg).unwrap();
+        assert_eq!(res, false, "file with no sessionId anywhere should return false");
+    }
+
+    #[test]
+    fn parse_and_upsert_basic_session() {
+        let conn = setup_mem_db();
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"sessionId":"s1","cwd":"/path/basic","type":"user","message":{{"content":"first user message"}}}}"#).unwrap();
+        writeln!(f, r#"{{"sessionId":"s1","type":"assistant","message":{{"model":"test-model","usage":{{"input_tokens":100,"output_tokens":50}}}}}}"#).unwrap();
+        writeln!(f, r#"{{"sessionId":"s1","type":"system","subtype":"away_summary","uuid":"uuid1","content":"This is a recap. (disable recaps in /config)"}}"#).unwrap();
+        writeln!(f, r#"{{"sessionId":"s1","type":"file-history-snapshot","snapshot":{{"trackedFileBackups":{{"/path/basic/foo.txt":{{}}}}}}}}"#).unwrap();
+        
+        let cfg = ClaudeConfig { projects: HashMap::new() };
+        let res = parse_and_upsert(&conn, f.path(), 1234, &cfg).unwrap();
+        assert!(res, "should have parsed correctly");
+
+        // Verify session
+        let (cwd, title, mc, has_recap, plan_mode): (String, String, i64, i64, i64) = conn.query_row(
+            "SELECT cwd, title, message_count, has_recap, plan_mode FROM sessions WHERE id='s1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        ).unwrap();
+        assert_eq!(cwd, "/path/basic");
+        assert_eq!(title, "first user message");
+        assert_eq!(mc, 2);
+        assert_eq!(has_recap, 1);
+        assert_eq!(plan_mode, 0);
+
+        // Verify recap
+        let (content, is_final): (String, i64) = conn.query_row(
+            "SELECT content, is_final FROM recaps WHERE uuid='uuid1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?))
+        ).unwrap();
+        assert_eq!(content, "This is a recap.");
+        assert_eq!(is_final, 1);
+
+        // Verify usage
+        let (model, itoks, otoks, usd): (String, i64, i64, f64) = conn.query_row(
+            "SELECT model, input_toks, output_toks, cost_usd FROM session_usage WHERE session_id='s1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        ).unwrap();
+        assert_eq!(model, "test-model");
+        assert_eq!(itoks, 100);
+        assert_eq!(otoks, 50);
+        assert_eq!(usd, (100.0/1_000_000.0)*10.0 + (50.0/1_000_000.0)*20.0);
+
+        // Verify files touched
+        let nfiles: i64 = conn.query_row("SELECT COUNT(*) FROM files_touched WHERE session_id='s1' AND file_path='/path/basic/foo.txt'", [], |r| r.get(0)).unwrap();
+        assert_eq!(nfiles, 1);
+    }
+
+    #[test]
+    fn parse_and_upsert_multibyte_title() {
+        let conn = setup_mem_db();
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"sessionId":"s-multi","cwd":"/p","type":"user","message":{{"content":"em-dash—here—and a curly “quote” emoji 🔥"}}}}"#).unwrap();
+        let cfg = ClaudeConfig { projects: HashMap::new() };
+        let res = parse_and_upsert(&conn, f.path(), 1234, &cfg).unwrap();
+        assert!(res);
+        let title: String = conn.query_row("SELECT title FROM sessions WHERE id='s-multi'", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "em-dash—here—and a curly “quote” emoji 🔥");
+    }
+
+    #[test]
+    fn parse_and_upsert_torn_line() {
+        let conn = setup_mem_db();
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, r#"{{"sessionId":"s2","type":"user","message":{{"content":"ok"}}}}"#).unwrap();
+        writeln!(f, r#"{{"sessionId":"s2","type":"user","message"#).unwrap(); // TORN LINE
+        let cfg = ClaudeConfig { projects: HashMap::new() };
+        let res = parse_and_upsert(&conn, f.path(), 1234, &cfg).unwrap();
+        assert!(res);
+        let mc: i64 = conn.query_row("SELECT message_count FROM sessions WHERE id='s2'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mc, 1);
+    }
+}

@@ -173,7 +173,10 @@ export interface PricingRow {
 export interface BlacklistEntry {
   pattern: string;
   createdAt: string | null;
-  /** Live count of indexed sessions this pattern currently hides. */
+  /**
+   * Honest live count of sessions this pattern hides: indexed-but-filtered rows
+   * plus files skipped at scan time (which never entered the sessions table).
+   */
   matchCount: number;
 }
 

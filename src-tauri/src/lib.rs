@@ -221,7 +221,8 @@ pub struct PricingRow {
 pub struct BlacklistEntry {
     pub pattern: String,
     pub created_at: Option<String>,
-    /// Live count of indexed sessions this pattern currently hides.
+    /// Honest live count of sessions this pattern hides: indexed-but-filtered
+    /// rows plus files skipped at scan time (which never entered `sessions`).
     pub match_count: i64,
 }
 
@@ -419,17 +420,24 @@ fn load_session_dirs(conn: &rusqlite::Connection) -> Vec<(String, String)> {
 fn blacklist_entries(conn: &rusqlite::Connection) -> Result<Vec<BlacklistEntry>, String> {
     let pairs = load_session_dirs(conn);
     let mut stmt = conn
-        .prepare("SELECT pattern, created_at FROM project_blacklist ORDER BY created_at")
+        .prepare(
+            "SELECT pattern, created_at, COALESCE(skipped_count, 0)
+             FROM project_blacklist ORDER BY created_at",
+        )
         .map_err(|e| e.to_string())?;
-    let rows: Vec<(String, Option<String>)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    let rows: Vec<(String, Option<String>, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .map_err(|e| e.to_string())?
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows
         .into_iter()
-        .map(|(pattern, created_at)| {
-            let match_count = count_matches(&pairs, &pattern);
+        .map(|(pattern, created_at, skipped_count)| {
+            // Honest two-source sum: indexed-but-filtered rows (source a) +
+            // files skipped at scan time that never entered `sessions` (source
+            // b, persisted by the indexer). Disjoint by construction, so adding
+            // is safe — no session is in both sets.
+            let match_count = count_matches(&pairs, &pattern) + skipped_count;
             BlacklistEntry {
                 pattern,
                 created_at,
@@ -1543,6 +1551,47 @@ mod tests {
         assert_eq!(count_matches(&pairs, "nonexistent"), 0);
         // Empty pattern list hides nothing.
         assert!(!dir_blacklisted(&pairs[0].0, &pairs[0].1, &[]));
+    }
+
+    #[test]
+    fn blacklist_entries_sum_is_disjoint_table_match_plus_skip_tally() {
+        // Minimal schema: the two tables blacklist_entries reads.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (cwd TEXT, project_dir TEXT, file_path TEXT);
+             CREATE TABLE project_blacklist (pattern TEXT PRIMARY KEY, created_at TEXT, skipped_count INTEGER DEFAULT 0);",
+        )
+        .unwrap();
+
+        // Source (a): one indexed-but-filtered session under the hidden tree,
+        // plus an innocent sibling that must NOT be counted.
+        conn.execute(
+            "INSERT INTO sessions (cwd, project_dir, file_path)
+             VALUES ('/Users/s/Projects/foo', '-Users-s-Projects-foo', '/a.jsonl')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (cwd, project_dir, file_path)
+             VALUES ('/Users/s/Projects/bar', '-Users-s-Projects-bar', '/b.jsonl')",
+            [],
+        )
+        .unwrap();
+
+        // Source (b): three files skipped at scan time (never in `sessions`),
+        // persisted by the indexer as the per-pattern skip tally.
+        conn.execute(
+            "INSERT INTO project_blacklist (pattern, created_at, skipped_count)
+             VALUES ('foo/**', '2026-01-01T00:00:00Z', 3)",
+            [],
+        )
+        .unwrap();
+
+        let entries = blacklist_entries(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        // (a)=1 table match + (b)=3 skipped = 4; the bar session is excluded and
+        // nothing is double-counted.
+        assert_eq!(entries[0].match_count, 4);
     }
 
     #[test]

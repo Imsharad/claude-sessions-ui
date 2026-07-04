@@ -148,6 +148,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     seed_pricing_if_empty(conn)?;
     migrate_v1(conn)?;
     migrate_v2(conn)?;
+    migrate_v3(conn)?;
     Ok(())
 }
 
@@ -212,6 +213,27 @@ fn migrate_v2(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute("UPDATE sessions SET file_mtime = 0", [])?;
     conn.pragma_update(None, "user_version", 2)?;
+    Ok(())
+}
+
+/// v3: honest blacklist counts. Adds `skipped_count` to `project_blacklist` — the
+/// per-pattern tally of session files the indexer skips at scan time (files that
+/// never enter `sessions`). `blacklist_entries` sums this with the table-match
+/// count so a seeded pattern (whose files were never indexed) still reports a
+/// live count. The indexer overwrites the tally each pass (see indexer::run), so
+/// on-disk deletions are reflected after the next refresh.
+fn migrate_v3(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 3 {
+        return Ok(());
+    }
+    add_column_if_missing(
+        conn,
+        "project_blacklist",
+        "skipped_count",
+        "skipped_count INTEGER DEFAULT 0",
+    )?;
+    conn.pragma_update(None, "user_version", 3)?;
     Ok(())
 }
 
@@ -347,9 +369,10 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
 
-        // user_version bumped to the latest applied migration (v1 schema + v2 heal).
+        // user_version bumped to the latest applied migration (v1 schema + v2 heal
+        // + v3 blacklist skip-tally column).
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
 
         // Blacklist table exists and is seeded exactly once
         let patterns = load_blacklist_patterns(&conn);
@@ -395,7 +418,7 @@ mod tests {
         // leave every user-curated field intact.
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
 
         let (mtime, area, pct, kanban): (i64, Option<String>, Option<i64>, Option<String>) = conn
             .query_row(

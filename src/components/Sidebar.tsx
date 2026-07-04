@@ -145,7 +145,21 @@ export function Sidebar({
         {others.length === 0 && pinned.length === 0 && <p className="px-3 py-2 text-[12px] text-ink-4">No projects indexed.</p>}
       </nav>
 
-      <div className="border-t border-border px-2 py-2">
+      <div className="border-t border-border px-2 pt-2 pb-3">
+        <button
+          onClick={() => setShowHidden((v) => !v)}
+          title="Hidden projects"
+          className={`flex w-full items-center gap-2 rounded-sm px-3 py-1.5 text-[13px] transition hover:bg-surface-3 ${
+            showHidden ? "text-ink-2" : "text-ink-3 hover:text-ink-2"
+          }`}
+        >
+          <EyeOff size={14} className="text-ink-3" />
+          <span className="flex-1 text-left font-medium">Hidden projects</span>
+          {blacklist.length > 0 && (
+            <span className="text-[11px] tabular-nums text-ink-4">{blacklist.length}</span>
+          )}
+        </button>
+
         <AnimatePresence initial={false}>
           {showHidden && (
             <motion.div
@@ -156,7 +170,7 @@ export function Sidebar({
               transition={{ type: "spring", stiffness: 400, damping: 30 }}
               className="overflow-hidden"
             >
-              <div className="pb-2 pt-1">
+              <div className="pt-1">
                 {blacklist.length === 0 ? (
                   <p className="px-3 py-1.5 text-[11.5px] leading-snug text-ink-4">
                     Add a pattern to hide a project tree from tracking.
@@ -175,10 +189,10 @@ export function Sidebar({
                       </span>
                       <button
                         onClick={() => handleRemoveHidden(b.pattern)}
-                        className="opacity-0 transition group-hover:opacity-100"
+                        className="shrink-0 transition"
                         title="Stop hiding this project"
                       >
-                        <X size={12} className="text-ink-4 hover:text-danger" />
+                        <X size={12} className="text-ink-4 transition-colors hover:text-ink-2" />
                       </button>
                     </div>
                   ))
@@ -213,20 +227,6 @@ export function Sidebar({
             </motion.div>
           )}
         </AnimatePresence>
-
-        <button
-          onClick={() => setShowHidden((v) => !v)}
-          title="Hidden projects"
-          className={`flex w-full items-center gap-2 rounded-sm px-3 py-1.5 text-[13px] transition hover:bg-surface-3 ${
-            showHidden ? "text-ink-2" : "text-ink-3 hover:text-ink-2"
-          }`}
-        >
-          <EyeOff size={14} className="text-ink-3" />
-          <span className="flex-1 text-left font-medium">Hidden projects</span>
-          {blacklist.length > 0 && (
-            <span className="text-[11px] tabular-nums text-ink-4">{blacklist.length}</span>
-          )}
-        </button>
       </div>
     </aside>
   );

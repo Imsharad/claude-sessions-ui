@@ -14,7 +14,7 @@ use crate::db::set_meta;
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -77,6 +77,17 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
     // (the query paths in lib.rs are the second enforcement point).
     let blacklist = crate::db::load_blacklist_patterns(conn);
 
+    // Per-pattern skip tally (source (b) of the honest blacklist count): session
+    // files skipped at scan time, which never enter `sessions`. Seed every pattern
+    // to 0 so a pattern whose files vanished from disk gets its stale count cleared
+    // this pass (overwrite semantics, not increment). Kept DISJOINT from the
+    // table-match count (lib::count_matches): a file already indexed (in `sessions`)
+    // is NOT tallied here — otherwise a pattern added after indexing would be
+    // double-counted (its rows linger in `sessions` yet also skip at scan time).
+    let indexed_paths: HashSet<String> = load_indexed_paths(conn);
+    let mut skip_tally: HashMap<String, i64> =
+        blacklist.iter().map(|p| (p.clone(), 0i64)).collect();
+
     let mut files_seen = 0usize;
     let mut files_reindexed = 0usize;
     let mut files_skipped = 0usize;
@@ -104,11 +115,25 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
     {
         files_seen += 1;
         let path = entry.path();
+        let path_str = path.to_string_lossy().to_string();
         let encoded_dir = path
             .parent()
             .and_then(|p| p.file_name().and_then(|s| s.to_str()))
             .unwrap_or("");
-        if blacklist.iter().any(|p| is_blacklisted_encoded(encoded_dir, p)) {
+        let mut blacklisted = false;
+        for p in &blacklist {
+            if is_blacklisted_encoded(encoded_dir, p) {
+                blacklisted = true;
+                // Tally only files that are NOT already indexed sessions — keeps
+                // source (b) disjoint from source (a) so no double count.
+                if !indexed_paths.contains(&path_str) {
+                    if let Some(c) = skip_tally.get_mut(p) {
+                        *c += 1;
+                    }
+                }
+            }
+        }
+        if blacklisted {
             continue;
         }
         let mtime = match file_mtime_secs(path) {
@@ -118,7 +143,6 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
                 continue;
             }
         };
-        let path_str = path.to_string_lossy().to_string();
         if !force_full {
             if let Some(&known) = known_mtimes.get(&path_str) {
                 if known == mtime {
@@ -142,6 +166,16 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
                 last_err = Some(format!("parse {}: {}", path.display(), e));
             }
         }
+    }
+
+    // Persist the per-pattern skip tally (overwrite, not increment) so the honest
+    // blacklist count reflects the current on-disk reality after this pass.
+    for (pattern, count) in &skip_tally {
+        conn.execute(
+            "UPDATE project_blacklist SET skipped_count = ?1 WHERE pattern = ?2",
+            params![count, pattern],
+        )
+        .ok();
     }
 
     // Rebuild the projects table from the now-current sessions.
@@ -174,6 +208,17 @@ fn file_mtime_secs(p: &Path) -> std::io::Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0))
+}
+
+/// All file paths currently in `sessions` — the "indexed" set, used to keep the
+/// blacklist skip tally disjoint from the table-match count.
+fn load_indexed_paths(conn: &Connection) -> HashSet<String> {
+    conn.prepare("SELECT file_path FROM sessions")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
 }
 
 fn load_known_mtimes(conn: &Connection) -> HashMap<String, i64> {

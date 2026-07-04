@@ -1097,8 +1097,14 @@ pub fn run() {
         .format_timestamp_secs()
         .init();
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    // ponytail: WebDriver plugin is E2E-only, gated to debug builds. It still links into
+    // the release binary but never initializes; ceiling — make it an optional cargo
+    // feature enabled only in dev to strip it from release entirely.
+    #[cfg(debug_assertions)]
+    let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .invoke_handler(tauri::generate_handler![
             reindex,
             index_status,

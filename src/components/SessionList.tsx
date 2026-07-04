@@ -282,9 +282,14 @@ export function SessionCardView({
         <div className="mt-0.5 truncate pl-[21px] text-[11.5px] text-ink-3">{s.title}</div>
       )}
 
-      <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 pl-[21px] text-[11px] text-ink-3">
-        <span className="inline-flex items-center gap-1.5">
-          <span className="font-medium text-ink-2">{shortProject}</span>
+      {/* Three atomic groups (gap 6): (project · branch [+ chips]) | (time ·
+          msgs · duration) | (cost · tokens). Each group is inline-flex +
+          whitespace-nowrap so it wraps as a whole unit; between-group spacing
+          is the container gap, never a standalone separator that could orphan
+          on its own line. */}
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 pl-[21px] text-[11px] text-ink-3">
+        <span className="inline-flex min-w-0 items-center gap-1.5 whitespace-nowrap">
+          <span className="max-w-[150px] truncate font-medium text-ink-2">{shortProject}</span>
           {s.gitBranch && (
             <span className="inline-flex items-center gap-0.5 font-mono text-ink-3">
               <GitBranch size={10} />
@@ -294,33 +299,31 @@ export function SessionCardView({
           <AreaChip area={s.areaOfLife} />
           <CompletionBadge session={s} />
         </span>
-        <span className="px-1.5 text-ink-4">·</span>
-        <span className="inline-flex items-center gap-1.5">
+        <span className="inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums">
           <span className="inline-flex items-center gap-0.5">
             <Clock size={10} />
             {relativeTime(s.lastTs)}
           </span>
-          <span className="inline-flex items-center gap-0.5 tabular-nums">
+          <span className="inline-flex items-center gap-0.5">
             <MessageSquare size={10} />
             {s.messageCount}
           </span>
-          {s.durationMs > 0 && (
-            <span className="tabular-nums">{formatDuration(s.durationMs)}</span>
-          )}
+          {s.durationMs > 0 && <span>{formatDuration(s.durationMs)}</span>}
         </span>
-        {(s.costUsd > 0.05 || s.inputToks > 0) && <span className="px-1.5 text-ink-4">·</span>}
-        <span className="ml-auto inline-flex items-center gap-1.5">
-          {s.costUsd > 0.05 && (
-            <span className="rounded-full bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-ink-2">
-              {formatCost(s.costUsd)}
-            </span>
-          )}
-          {s.inputToks > 0 && (
-            <span className="font-mono text-[10px] tabular-nums text-ink-4">
-              {formatTokens(s.inputToks + s.outputToks)}
-            </span>
-          )}
-        </span>
+        {(s.costUsd > 0.05 || s.inputToks > 0) && (
+          <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+            {s.costUsd > 0.05 && (
+              <span className="rounded-full bg-surface-3 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-ink-2">
+                {formatCost(s.costUsd)}
+              </span>
+            )}
+            {s.inputToks > 0 && (
+              <span className="font-mono text-[10px] tabular-nums text-ink-4">
+                {formatTokens(s.inputToks + s.outputToks)}
+              </span>
+            )}
+          </span>
+        )}
       </div>
 
       {s.planMode && (

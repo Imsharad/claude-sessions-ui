@@ -51,14 +51,29 @@ rather than dispatching a blind session.
    ```
    Capture the full stdout and extract the numeric session id it prints. Record it.
 
-3. **Poll.** Loop `jules remote list --session` (plain-text output — read it, don't
-   grep blindly) and find your session id's status. Re-check on a modest cadence.
-   - `Planning` / `In Progress` → keep waiting.
+3. **Poll — as ONE detached bash loop, never by repeated tool calls.** Token
+   discipline: do NOT poll by calling `jules remote list` yourself over and over —
+   each such call is a model turn and burns tokens (and foreground `sleep` is blocked
+   here, so you'd busy-loop). Instead launch a SINGLE background bash loop that sleeps
+   between checks and exits only when your session id reaches a terminal state. You are
+   then re-invoked exactly once, on exit. Pattern:
+   ```
+   SID=<id>
+   for i in $(seq 1 90); do
+     st=$(jules remote list --session 2>/dev/null | grep "$SID" \
+          | grep -oiE "Completed|Failed|Awaiting|In Progress|Planning" | tail -1)
+     echo "[check $i] $st"
+     echo "$st" | grep -qiE "Completed|Failed|Awaiting" && { echo "TERMINAL:$st"; break; }
+     sleep 20
+   done
+   ```
+   Run it with run_in_background. When it exits, read the last status:
    - `Completed` → go to step 4.
    - `Failed` → STOP. Report the failure and any Jules output. Do NOT auto-retry and
      do NOT reuse the id; the parent decides whether to redispatch a corrected prompt.
    - `Awaiting User Feedback` → STOP and escalate the question to the parent. Never
      guess an answer on Jules' behalf.
+   (Note: `status` is a read-only variable in zsh — use `st`, not `status`.)
 
 4. **Apply locally.** `jules remote pull --session <id> --apply`. The `--apply` flag
    is required — without it the patch is not written to the working tree.

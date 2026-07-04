@@ -735,35 +735,50 @@ fn truncate_str(s: &str, max: usize) -> String {
 }
 
 /// Clean a candidate title so prompt-content garbage doesn't leak as the
-/// display title. Mirrors the frontend sanitizeTitle logic so both stay
-/// consistent. Returns None if nothing usable remains.
+/// display title. Rust-only — there is no frontend counterpart; the stored
+/// title is authoritative. Returns None if nothing usable remains.
 ///
-///   "<instructions><references>"  →  "instructions references"
-///   "## Task: do X"               →  "Task: do X"
+/// Preserves *interior* underscores / asterisks / backticks so real identifiers
+/// survive intact ("TAG_AND_TRIAGE_PROMPT.md", "snake_case_name"). Only a
+/// *wrapping* emphasis pair is peeled ("_wrapped_" -> "wrapped",
+/// "**bold**" -> "bold"). Also strips leading prompt scaffolding (list markers,
+/// blockquotes, headers) and XML/HTML tags.
+///
+///   "<instructions>Hello</instructions>"  →  "Hello"
+///   "## Task: do X"                       →  "Task: do X"
+///   "- Use the files: -"                  →  "Use the files: -"
 fn sanitize_title(raw: &str) -> Option<String> {
     let mut s = raw.trim().to_string();
     if s.is_empty() {
         return None;
     }
-    // Strip XML/HTML tags, keep inner text.
-    while let (Some(start), _) = (s.find('<'), s.find('>')) {
-        if let Some(end) = s.find('>') {
-            if end > start {
+    // Strip XML/HTML tags (including their attributes), keeping inner text.
+    // Scan for '<' then the next '>' AFTER it, so a stray '>' before the first
+    // '<' can't confuse the range.
+    while let Some(start) = s.find('<') {
+        match s[start + 1..].find('>') {
+            Some(rel) => {
+                let end = start + 1 + rel;
                 s.replace_range(start..=end, " ");
-            } else {
-                break;
             }
-        } else {
-            break;
+            None => break,
         }
     }
-    // Strip markdown headers / emphasis.
-    let stripped = s.trim_start_matches('#').trim_start();
-    let stripped = stripped.replace(['*', '_', '`'], "");
-    s = stripped;
-    // Collapse whitespace.
+    // Collapse whitespace runs to single spaces up front so marker / emphasis
+    // checks see clean tokens.
     s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Drop leading @ / / file-ref noise.
+    // Peel leading prompt scaffolding — markdown headers, list markers,
+    // blockquotes — possibly stacked (e.g. "> - text").
+    loop {
+        let peeled = peel_leading_marker(&s);
+        if peeled.len() == s.len() {
+            break;
+        }
+        s = peeled.trim_start().to_string();
+    }
+    // Peel a *wrapping* emphasis pair only — interior _ * ` are preserved.
+    s = strip_wrapping_emphasis(&s);
+    // Drop leading @ / \ file-ref noise (interior slashes stay: "src/foo.rs").
     s = s.trim_start_matches(|c: char| c == '@' || c == '/' || c == '\\').to_string();
     let s = s.trim().to_string();
     if s.is_empty() {
@@ -771,6 +786,57 @@ fn sanitize_title(raw: &str) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Peel a single leading scaffolding marker (header hash, ordered/unordered
+/// list bullet, blockquote). Returns the remainder, or the trimmed input
+/// unchanged when no marker leads. Callers loop until it stabilises.
+fn peel_leading_marker(s: &str) -> &str {
+    let t = s.trim_start();
+    // Markdown header hash(es): peel one '#' per call, loop handles "##".
+    if let Some(rest) = t.strip_prefix('#') {
+        return rest;
+    }
+    // Ordered list: leading ASCII digits followed by ". ".
+    let dlen = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    if dlen > 0 {
+        if let Some(rest) = t[dlen..].strip_prefix(". ") {
+            return rest;
+        }
+    }
+    // Unordered bullets / blockquote (require the trailing space so we never
+    // eat a real "*emphasis*" or "-hyphenated" token).
+    for m in ["- ", "* ", "+ ", "> "] {
+        if let Some(rest) = t.strip_prefix(m) {
+            return rest;
+        }
+    }
+    t
+}
+
+/// Strip a *wrapping* emphasis pair ("_x_", "*x*", "**x**", "`x`") — but only
+/// when the marker does not recur inside, so structural markers survive
+/// ("snake_case_name" is untouched because it does not start/end with '_';
+/// "a_b_c" wrapped in '_' would keep its interior separators).
+fn strip_wrapping_emphasis(s: &str) -> String {
+    let mut s = s.trim();
+    loop {
+        let mut changed = false;
+        for marker in ["**", "__", "*", "_", "`"] {
+            if s.len() > 2 * marker.len() && s.starts_with(marker) && s.ends_with(marker) {
+                let inner = s[marker.len()..s.len() - marker.len()].trim();
+                if !inner.is_empty() && !inner.contains(marker) {
+                    s = inner;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    s.to_string()
 }
 
 /// Difference between two ISO timestamps in milliseconds (best-effort).
@@ -938,6 +1004,18 @@ mod tests {
         assert_eq!(sanitize_title("@/src/foo.rs").unwrap(), "src/foo.rs");
         assert_eq!(sanitize_title("    _test_  ").unwrap(), "test");
         assert!(sanitize_title("<tag></tag>").is_none());
+        // Interior underscores/identifiers are preserved (no blanket stripping).
+        assert_eq!(sanitize_title("TAG_AND_TRIAGE_PROMPT.md").unwrap(), "TAG_AND_TRIAGE_PROMPT.md");
+        assert_eq!(sanitize_title("snake_case_name").unwrap(), "snake_case_name");
+        // Only a genuine wrapping emphasis pair is peeled.
+        assert_eq!(sanitize_title("_wrapped_").unwrap(), "wrapped");
+        assert_eq!(sanitize_title("**bold**").unwrap(), "bold");
+        // XML tags with attributes are stripped, inner text kept.
+        assert_eq!(sanitize_title(r#"<tool name="x">run tests</tool>"#).unwrap(), "run tests");
+        // Leading list / blockquote scaffolding is peeled; trailing debris stays.
+        assert_eq!(sanitize_title("- Use the following files as reference: -").unwrap(), "Use the following files as reference: -");
+        assert_eq!(sanitize_title("> - quoted bullet").unwrap(), "quoted bullet");
+        assert_eq!(sanitize_title("1. first step").unwrap(), "first step");
     }
 
     #[test]

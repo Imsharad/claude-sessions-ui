@@ -147,6 +147,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // Seed pricing defaults once. UPDATE OR INSERT pattern via temp absence check.
     seed_pricing_if_empty(conn)?;
     migrate_v1(conn)?;
+    migrate_v2(conn)?;
     Ok(())
 }
 
@@ -192,6 +193,25 @@ fn migrate_v1(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     conn.pragma_update(None, "user_version", 1)?;
+    Ok(())
+}
+
+/// v2: heal titles mangled by the pre-fix `sanitize_title` (which blanket-stripped
+/// underscores, so "TAG_AND_TRIAGE_PROMPT.md" was persisted as "TAGANDTRIAGEPROMPT.md").
+/// The corrupted title lives in the `sessions` row, so fixing the function alone
+/// leaves stored rows wrong. Force a one-time re-derivation by zeroing every
+/// session's stored `file_mtime`: the indexer's incremental scan skips a file
+/// only when its stored mtime equals the file's real mtime, so a zeroed value
+/// guarantees a re-parse (and thus a re-sanitize) on the next pass without a
+/// wipe. The upsert rewrites only parsed fields (title, timestamps, counts…),
+/// never the tag/kanban columns, so user curation survives untouched.
+fn migrate_v2(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 2 {
+        return Ok(());
+    }
+    conn.execute("UPDATE sessions SET file_mtime = 0", [])?;
+    conn.pragma_update(None, "user_version", 2)?;
     Ok(())
 }
 
@@ -327,9 +347,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
 
-        // user_version bumped
+        // user_version bumped to the latest applied migration (v1 schema + v2 heal).
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
 
         // Blacklist table exists and is seeded exactly once
         let patterns = load_blacklist_patterns(&conn);
@@ -356,5 +376,43 @@ mod tests {
         conn.execute("DELETE FROM project_blacklist", []).unwrap();
         migrate(&conn).unwrap();
         assert!(load_blacklist_patterns(&conn).is_empty(), "seed must not reappear");
+    }
+
+    #[test]
+    fn migrate_v2_zeroes_mtime_to_force_title_reheal_without_wiping_tags() {
+        // Simulate a pre-v2 DB: schema present but user_version pinned below 2,
+        // holding a session with a real mtime and user-set tag/kanban fields.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, file_path, file_mtime, title, area_of_life, completion_pct, kanban_status)
+             VALUES ('s1', '/tmp/x.jsonl', 1700000000, 'TAGANDTRIAGEPROMPT.md', 'Building', 42, 'in_progress')",
+            [],
+        ).unwrap();
+
+        // Re-run migrations: v2 should zero the mtime (forcing a re-parse) but
+        // leave every user-curated field intact.
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 2);
+
+        let (mtime, area, pct, kanban): (i64, Option<String>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT file_mtime, area_of_life, completion_pct, kanban_status FROM sessions WHERE id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(mtime, 0, "mtime must be zeroed so the indexer re-derives the title");
+        assert_eq!(area.as_deref(), Some("Building"), "tags must survive the heal");
+        assert_eq!(pct, Some(42));
+        assert_eq!(kanban.as_deref(), Some("in_progress"));
+
+        // Idempotent: a second run does not re-zero (mtime a later index restored).
+        conn.execute("UPDATE sessions SET file_mtime = 1700000001 WHERE id='s1'", []).unwrap();
+        migrate(&conn).unwrap();
+        let mtime2: i64 = conn.query_row("SELECT file_mtime FROM sessions WHERE id='s1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mtime2, 1700000001, "v2 must not re-run once user_version >= 2");
     }
 }

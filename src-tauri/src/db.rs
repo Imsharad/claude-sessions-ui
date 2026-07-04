@@ -153,9 +153,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 /// mid-2026; user can override. Conservative: if a model isn't found, the
 /// indexer falls back to zero cost (and marks it estimate with a null price).
 fn seed_pricing_if_empty(conn: &Connection) -> rusqlite::Result<()> {
-    let n: i64 =
-        conn.query_row("SELECT COUNT(*) FROM pricing", [], |r| r.get(0))?;
-    if n > 0 {
+    // ponytail: inline query
+    if conn.query_row("SELECT COUNT(*) FROM pricing", [], |r| r.get::<_, i64>(0))? > 0 {
         return Ok(());
     }
     // (model, in, out, cache_write, cache_read) — $/Mtok

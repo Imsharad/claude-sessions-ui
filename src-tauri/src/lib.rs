@@ -270,26 +270,13 @@ fn list_sessions(filter: Option<SessionFilter>) -> Result<Vec<SessionCard>, Stri
     }
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    let n_binds = binds.len();
-    let rows = match n_binds {
-        0 => stmt.query_map([], map_session_card),
-        1 => stmt.query_map(params![binds[0]], map_session_card),
-        2 => stmt.query_map(params![binds[0], binds[1]], map_session_card),
-        3 => stmt.query_map(
-            params![binds[0], binds[1], binds[2]],
-            map_session_card,
-        ),
-        _ => Err(rusqlite::Error::ToSqlConversionFailure(
-            "too many binds".into(),
-        )),
-    }
-    .map_err(|e| e.to_string())?;
-
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r.map_err(|e| e.to_string())?);
-    }
-    Ok(out)
+    // ponytail: iter over dynamic params, functional collect
+    let out: Result<Vec<SessionCard>, String> = stmt
+        .query_map(rusqlite::params_from_iter(binds), map_session_card)
+        .map_err(|e| e.to_string())?
+        .map(|r| r.map_err(|e| e.to_string()))
+        .collect();
+    out
 }
 
 fn map_session_card(r: &rusqlite::Row) -> rusqlite::Result<SessionCard> {
@@ -907,7 +894,8 @@ fn get_pricing() -> Result<Vec<PricingRow>, String> {
              FROM pricing ORDER BY model",
         )
         .map_err(|e| e.to_string())?;
-    let rows = stmt
+    // ponytail: iter mapping
+    let out: Result<Vec<_>, String> = stmt
         .query_map([], |r| {
             Ok(PricingRow {
                 model: r.get(0)?,
@@ -917,12 +905,10 @@ fn get_pricing() -> Result<Vec<PricingRow>, String> {
                 cache_read_per_mtok: r.get(4)?,
             })
         })
-        .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r.map_err(|e| e.to_string())?);
-    }
-    Ok(out)
+        .map_err(|e| e.to_string())?
+        .map(|r| r.map_err(|e| e.to_string()))
+        .collect();
+    out
 }
 
 #[tauri::command]

@@ -12,13 +12,21 @@
 //!   toggle_pin(encoded_dir)
 //!   index_status() -> IndexStatus
 
+pub mod anthropic;
 pub mod claude;
 pub mod db;
+pub mod digest;
+pub mod home;
 pub mod indexer;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tauri::Emitter;
 use std::collections::HashMap;
+
+use digest::{DigestBatchReport, SessionDigest, Thread, TimelineResponse};
 
 // ─── IPC types ──────────────────────────────────────────────────────────────
 
@@ -83,6 +91,10 @@ pub struct SessionCard {
     pub manual_fields: Vec<String>,
     pub kanban_status: Option<String>,
     pub kanban_order: Option<f64>,
+    /// The session's stated next step, derived at read time from the final recap's
+    /// text (see `extract_next_action`). Only `get_session_detail` populates it; the
+    /// list query leaves it None. None when no next-step marker is found.
+    pub next_action: Option<String>,
 }
 
 /// Parse the `manual_fields` column (a JSON array string of field names) into a
@@ -224,6 +236,15 @@ pub struct BlacklistEntry {
     /// Honest live count of sessions this pattern hides: indexed-but-filtered
     /// rows plus files skipped at scan time (which never entered `sessions`).
     pub match_count: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BlacklistPreview {
+    /// Distinct projects a candidate pattern would hide (indexed sessions only).
+    pub project_count: i64,
+    /// Indexed sessions a candidate pattern would hide.
+    pub session_count: i64,
 }
 
 use claude::TagError;
@@ -371,6 +392,9 @@ fn map_session_card(r: &rusqlite::Row) -> rusqlite::Result<SessionCard> {
         manual_fields: parse_manual_fields(r.get(23)?),
         kanban_status: r.get(24)?,
         kanban_order: r.get(25)?,
+        // Derived at read time, and only in the detail command (which has the
+        // recaps in hand). The list query leaves it None.
+        next_action: None,
     })
 }
 
@@ -447,6 +471,32 @@ fn blacklist_entries(conn: &rusqlite::Connection) -> Result<Vec<BlacklistEntry>,
         .collect())
 }
 
+/// What a candidate pattern WOULD hide, over indexed sessions only. Sessions
+/// already skipped at scan time by another pattern are invisible here — fine,
+/// they are hidden either way, and a candidate is judged on what it changes.
+fn preview_counts(pairs: &[(String, String)], pattern: &str) -> (i64, i64) {
+    let mut projects = std::collections::HashSet::new();
+    let mut sessions = 0i64;
+    for (cwd, pd) in pairs {
+        if indexer::is_blacklisted(cwd, pattern) || indexer::is_blacklisted_encoded(pd, pattern) {
+            sessions += 1;
+            projects.insert(pd.as_str());
+        }
+    }
+    (projects.len() as i64, sessions)
+}
+
+#[tauri::command]
+fn preview_blacklist_pattern(pattern: String) -> Result<BlacklistPreview, String> {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return Ok(BlacklistPreview { project_count: 0, session_count: 0 });
+    }
+    let conn = db::open().map_err(|e| e.to_string())?;
+    let (project_count, session_count) = preview_counts(&load_session_dirs(&conn), p);
+    Ok(BlacklistPreview { project_count, session_count })
+}
+
 #[tauri::command]
 fn list_blacklist() -> Result<Vec<BlacklistEntry>, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
@@ -479,12 +529,91 @@ fn remove_blacklist_pattern(pattern: String) -> Result<Vec<BlacklistEntry>, Stri
     blacklist_entries(&conn)
 }
 
+// ─── Home screen: threads ────────────────────────────────────────────────────
+// Clusters the indexed (non-blacklisted) sessions into work threads, scores them
+// (recency × density × unfinished × pinned, gated by a substance guard), and
+// returns the top `limit` with a templated why-sentence. All ranking logic lives
+// in home.rs (pure + unit-tested); this wrapper just loads rows, ranks, and fills
+// the winners' open-todo contents.
+
+#[tauri::command]
+fn list_threads(limit: Option<usize>) -> Result<home::HomeData, String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    let rows = home::load_session_rows(&conn)?;
+    let mut data = home::build_home(rows, chrono::Utc::now(), limit.unwrap_or(5));
+    // Second query: open-todo contents for the winning threads' latest sessions.
+    for t in &mut data.threads {
+        t.open_todos = home::load_open_todos(&conn, &t.latest_session_id);
+    }
+    Ok(data)
+}
+
+// ─── Next-action extraction ──────────────────────────────────────────────────
+// Derived, not stored: the detail command reads the final recap's text and pulls
+// the first stated next step out of it. No DB column, no migration — recompute on
+// each read, which is cheap against a single already-loaded recap.
+
+/// Markers that introduce a stated next step, matched case-insensitively. Kept as
+/// literals (no regex dependency); the barest "next:" is last only for readability
+/// — selection is by earliest position in the text, not list order.
+const NEXT_ACTION_MARKERS: [&str; 6] = [
+    "next action is",
+    "next action:",
+    "next steps:",
+    "next up:",
+    "todo next",
+    "next:",
+];
+
+/// Cap on the returned string so a marker followed by a wall of text can't bloat
+/// the payload. ~200 chars per the spec.
+const NEXT_ACTION_MAX_CHARS: usize = 200;
+
+/// Pick the recap to derive the next action from — the one marked final, else the
+/// most recent (recaps arrive ordered by seq ascending, so `last`). None when the
+/// chosen recap has no next-step marker.
+fn next_action_from_recaps(recaps: &[Recap]) -> Option<String> {
+    let chosen = recaps.iter().find(|r| r.is_final).or_else(|| recaps.last())?;
+    extract_next_action(&chosen.content)
+}
+
+/// Extract a session's stated next step from a recap's text. Finds the first
+/// occurrence of any next-step marker and returns the remainder of that line after
+/// it, whitespace-normalized and capped. None when no marker is present, or when
+/// only whitespace follows it — never an empty string.
+fn extract_next_action(content: &str) -> Option<String> {
+    // ASCII-lowercase keeps byte length (and char boundaries) identical to the
+    // original, so a match index found here slices `content` safely. The markers
+    // are all ASCII, so ASCII folding is enough to match case-insensitively.
+    let lower = content.to_ascii_lowercase();
+    // Earliest marker wins; on a tie at the same index the longer marker wins, so
+    // "next action:" beats a bare "next:" that would start at the same place.
+    let (idx, marker_len) = NEXT_ACTION_MARKERS
+        .iter()
+        .filter_map(|m| lower.find(m).map(|i| (i, m.len())))
+        .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))?;
+
+    // Remainder of the line after the marker (a next step is a single line here).
+    let after = &content[idx + marker_len..];
+    let line = after.split(['\n', '\r']).next().unwrap_or(after);
+    // Whitespace-normalize (collapse runs, drop leading/trailing), then cap.
+    let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let capped: String = normalized.chars().take(NEXT_ACTION_MAX_CHARS).collect();
+    let trimmed = capped.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[tauri::command]
 fn get_session_detail(id: String) -> Result<SessionDetail, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
 
-    // Card row — direct lookup instead of loading every session.
-    let card: SessionCard = {
+    // Card row — direct lookup instead of loading every session. Mutable so the
+    // derived next_action can be filled in once the recaps are loaded below.
+    let mut card: SessionCard = {
         let mut stmt = conn
             .prepare(
                 "SELECT s.id, s.project_dir, s.cwd, s.git_branch, s.title, s.first_ts, s.last_ts,
@@ -522,6 +651,9 @@ fn get_session_detail(id: String) -> Result<SessionDetail, String> {
         .filter_map(|r| r.ok())
         .collect();
     drop(stmt);
+
+    // Derived next step: read from the final recap (else the most recent one).
+    card.next_action = next_action_from_recaps(&recaps);
 
     // Todos
     let mut stmt = conn
@@ -1235,6 +1367,9 @@ fn validate_tags(v: &serde_json::Value) -> Result<ValidatedTags, TagError> {
 
 /// Compact classification prompt: the controlled vocabulary + the session's
 /// recap and metadata, demanding ONLY a strict JSON object.
+// ponytail: ~450 in / ~70 out tok per call ≈ $0.075/100 sessions on Haiku (input
+// $1/M, output $5/M) — vs the CLI's measured $1.89/100. Over the $0.05 soft target;
+// batching (backfill) is the lever if it ever needs to go lower.
 fn build_tag_prompt(ctx: &TagContext) -> String {
     let areas = AREAS_OF_LIFE.join(", ");
     let recap = ctx.recap.as_deref().unwrap_or("(no recap was captured for this session)");
@@ -1292,7 +1427,10 @@ fn load_tag_context(conn: &rusqlite::Connection, id: &str) -> Result<TagContext,
         project: project_display(&cwd),
         message_count,
         duration_ms,
-        recap,
+        // ponytail: cap recap at ~1200 chars (~300 tok) — classification reads the
+        // lead, not the tail. Ceiling: a very long session's tail is dropped;
+        // upgrade = head+tail slice or a pre-summary if quality dips.
+        recap: recap.map(|r| r.chars().take(1200).collect()),
         todos_total,
         todos_done,
     })
@@ -1384,7 +1522,16 @@ fn tag_session_blocking(id: &str) -> Result<SessionTags, TagError> {
     let conn = db::open().map_err(db_err)?;
     let ctx = load_tag_context(&conn, id)?;
     let prompt = build_tag_prompt(&ctx);
-    let result_text = claude::run_headless(&prompt, TAGGING_MODEL)?;
+    // Fast path: direct API. Degrade to the CLI (its own OAuth auth, slower) when no
+    // key or a transient transport failure. A 4xx/429 surfaces typed — retrying on the
+    // CLI won't help and would double-spend.
+    let result_text = match anthropic::tag_via_api(&prompt, TAGGING_MODEL) {
+        Ok(t) => t,
+        Err(e) if matches!(e.kind.as_str(), "no_api_key" | "timeout" | "api_http") => {
+            claude::run_headless(&prompt, TAGGING_MODEL)?
+        }
+        Err(e) => return Err(e),
+    };
     let json = extract_json_object(&result_text)?;
     let validated = validate_tags(&json)?;
     persist_auto_tags(&conn, id, &validated)
@@ -1397,6 +1544,96 @@ async fn tag_session(id: String) -> Result<SessionTags, TagError> {
     tauri::async_runtime::spawn_blocking(move || tag_session_blocking(&id))
         .await
         .map_err(|e| TagError::new("cli_failed", format!("tag task failed to join: {e}")))?
+}
+
+// ─── Bulk backfill (Feature 3b) ─────────────────────────────────────────────
+// Tag every untagged session over the direct-API path, concurrently. Resumable
+// via `WHERE tagged_at IS NULL` — a crash just re-queries the remainder. No CLI
+// fallback here: a backfill can't afford 11s-per-failure.
+
+/// Backfill report returned to the UI. camelCase over the wire (mirror in ipc.ts).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackfillReport {
+    tagged: usize,
+    failed: usize,
+    skipped_no_key: bool,
+}
+
+const BACKFILL_WORKERS: usize = 6;
+
+/// Tag one session via the API path only (no CLI fallback). Shares every downstream
+/// step with tag_session_blocking, so tag quality + manual-field protection are identical.
+fn tag_one_via_api(conn: &rusqlite::Connection, id: &str) -> Result<(), TagError> {
+    let ctx = load_tag_context(conn, id)?;
+    let prompt = build_tag_prompt(&ctx);
+    let text = anthropic::tag_via_api(&prompt, TAGGING_MODEL)?;
+    let json = extract_json_object(&text)?;
+    let validated = validate_tags(&json)?;
+    persist_auto_tags(conn, id, &validated)?;
+    Ok(())
+}
+
+fn backfill_blocking(app: tauri::AppHandle) -> Result<BackfillReport, TagError> {
+    if !anthropic::has_api_key() {
+        return Ok(BackfillReport { tagged: 0, failed: 0, skipped_no_key: true });
+    }
+    let conn = db::open().map_err(db_err)?;
+    // Resumable: only untagged rows. A crash mid-run just re-queries the rest; a
+    // completed row (tagged_at set) drops out. No progress table needed.
+    let ids: Vec<String> = conn
+        .prepare("SELECT id FROM sessions WHERE tagged_at IS NULL")
+        .map_err(db_err)?
+        .query_map([], |r| r.get(0))
+        .map_err(db_err)?
+        .filter_map(Result::ok)
+        .collect();
+    drop(conn);
+
+    let total = ids.len();
+    let done = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+
+    // ponytail: fixed worker count, chunk-and-join — no semaphore/pool crate. Each
+    // worker owns a contiguous slice + its own DB connection (WAL serializes the tiny
+    // writes; contention is trivial next to the ~1s network call).
+    // Ceiling: no per-session batching, so ~$0.075/100 (~1.5x the $0.05 soft target);
+    // upgrade path = batch N ids per API call to amortize the instruction prefix.
+    let chunk = total.div_ceil(BACKFILL_WORKERS.max(1)).max(1);
+    std::thread::scope(|s| {
+        for group in ids.chunks(chunk) {
+            let (app, done, failed) = (app.clone(), done.clone(), failed.clone());
+            s.spawn(move || {
+                let conn = match db::open() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                for id in group {
+                    match tag_one_via_api(&conn, id) {
+                        Ok(()) => done.fetch_add(1, Ordering::Relaxed),
+                        Err(_) => failed.fetch_add(1, Ordering::Relaxed),
+                    };
+                    let n = done.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
+                    let _ = app.emit("backfill_progress", (n, total));
+                }
+            });
+        }
+    });
+
+    Ok(BackfillReport {
+        tagged: done.load(Ordering::Relaxed),
+        failed: failed.load(Ordering::Relaxed),
+        skipped_no_key: false,
+    })
+}
+
+/// Tag every untagged session concurrently. Resumable, no CLI fallback. Returns
+/// `skippedNoKey: true` (a no-op) when no ANTHROPIC_API_KEY is available.
+#[tauri::command]
+async fn backfill_tags(app: tauri::AppHandle) -> Result<BackfillReport, TagError> {
+    tauri::async_runtime::spawn_blocking(move || backfill_blocking(app))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("backfill task failed to join: {e}")))?
 }
 
 /// Hand-edit path: apply ONLY the provided fields, validate, and flag each
@@ -1511,6 +1748,67 @@ fn set_kanban(id: String, status: Option<String>, order: Option<f64>) -> Result<
     Ok(())
 }
 
+// ─── Timeline digest (P6) ────────────────────────────────────────────────────
+// A read-only weekly reconstruction surface. get_timeline computes the day
+// skeleton in SQL/Rust (never the LLM) and joins in stored digests + threads.
+// digest_session / digest_pending fill per-session slots; link_threads runs the
+// second-phase linking pass over ONLY existing digest rows. All validation +
+// referential checks live in digest.rs; the frontend reads only from the store.
+
+/// Read-only timeline: full day skeleton (gap days included), stored digests,
+/// and threads intersecting the window. No LLM.
+#[tauri::command]
+fn get_timeline(days: u32) -> Result<TimelineResponse, TagError> {
+    let conn = db::open().map_err(db_err)?;
+    digest::build_timeline(&conn, days)
+}
+
+/// Generate-or-return-cached digest for one session. Async so the UI stays
+/// responsive; the blocking HTTP call runs on the blocking pool, like tag_session.
+/// No recap rows → typed "no_recap".
+#[tauri::command]
+async fn digest_session(id: String) -> Result<SessionDigest, TagError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open().map_err(db_err)?;
+        digest::generate_or_cache(&conn, &id, true).map(|o| o.into_inner())
+    })
+    .await
+    .map_err(|e| TagError::new("cli_failed", format!("digest task failed to join: {e}")))?
+}
+
+/// Backfill digests for the window: generate the missing/stale/hash-changed,
+/// bounded concurrency of 4, never aborting on one failure. No-recap sessions
+/// are a truthful skip.
+#[tauri::command]
+async fn digest_pending(days: u32) -> Result<DigestBatchReport, TagError> {
+    tauri::async_runtime::spawn_blocking(move || digest::digest_pending_blocking(days))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("digest_pending task failed to join: {e}")))?
+}
+
+/// Second-phase linking pass: group window sessions whose digests continue one
+/// arc. Every member id is validated against the input set; replace-not-append.
+#[tauri::command]
+async fn link_threads(days: u32) -> Result<Vec<Thread>, TagError> {
+    tauri::async_runtime::spawn_blocking(move || digest::link_threads_blocking(days))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("link_threads task failed to join: {e}")))?
+}
+
+/// Manual-edit path: apply only the provided fields, validate to the same
+/// limits, and flag each edited field in manual_fields so auto-regeneration
+/// won't clobber it. Synchronous — no LLM involved.
+#[tauri::command]
+fn update_session_digest(
+    id: String,
+    worked_on: Option<String>,
+    outcome: Option<String>,
+    open_loops: Option<Vec<String>>,
+) -> Result<SessionDigest, TagError> {
+    let conn = db::open().map_err(db_err)?;
+    digest::update_digest(&conn, &id, worked_on, outcome, open_loops)
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 // Pure-logic probes for the ranker + snippet extractor. The DB-backed
 // search_recaps is exercised end-to-end via the running app; these cover the
@@ -1551,6 +1849,78 @@ mod tests {
         assert_eq!(count_matches(&pairs, "nonexistent"), 0);
         // Empty pattern list hides nothing.
         assert!(!dir_blacklisted(&pairs[0].0, &pairs[0].1, &[]));
+    }
+
+    #[test]
+    fn next_action_marker_mid_paragraph() {
+        // Marker sits mid-recap; we take the remainder of its line, not the prose
+        // before it, and stop at the line break.
+        let recap = "We shipped the parser and cleaned up the tests.\n\
+                     Next steps: wire the frontend to the new field.\n\
+                     Nothing else outstanding.";
+        assert_eq!(
+            extract_next_action(recap).as_deref(),
+            Some("wire the frontend to the new field.")
+        );
+    }
+
+    #[test]
+    fn next_action_is_your_call_phrasing() {
+        // The "Next action is ..." variant has no colon; the "your call:" prefix is
+        // kept verbatim per spec (we return the remainder as-is).
+        let recap = "Summary of the session.\nNext action is your call: review the PR then merge.";
+        assert_eq!(
+            extract_next_action(recap).as_deref(),
+            Some("your call: review the PR then merge.")
+        );
+    }
+
+    #[test]
+    fn next_action_none_when_no_marker() {
+        // No marker anywhere → None, never an empty string.
+        let recap = "Refactored the indexer and added a couple of tests. All green.";
+        assert_eq!(extract_next_action(recap), None);
+        // A marker followed by only whitespace also yields None.
+        assert_eq!(extract_next_action("Next:   \n"), None);
+    }
+
+    #[test]
+    fn next_action_whitespace_normalized_and_case_insensitive() {
+        // Case-insensitive marker match; internal whitespace runs collapse to one
+        // space and the result is trimmed.
+        let recap = "NEXT ACTION:    deploy   the\tbuild   to staging  ";
+        assert_eq!(
+            extract_next_action(recap).as_deref(),
+            Some("deploy the build to staging")
+        );
+    }
+
+    #[test]
+    fn preview_counts_distinct_projects_and_sessions() {
+        // Two sessions in one hidden project, one in another, one innocent.
+        let pairs = vec![
+            (
+                "/Users/s/tmp/stu_1340".to_string(),
+                "-Users-s-tmp-stu_1340".to_string(),
+            ),
+            (
+                "/Users/s/tmp/stu_1340/sub".to_string(),
+                "-Users-s-tmp-stu_1340-sub".to_string(),
+            ),
+            (
+                "/Users/s/tmp/stu_169".to_string(),
+                "-Users-s-tmp-stu_169".to_string(),
+            ),
+            (
+                "/Users/s/Projects/brain".to_string(),
+                "-Users-s-Projects-brain".to_string(),
+            ),
+        ];
+        // A tree pattern spans multiple projects; sessions count every row.
+        assert_eq!(preview_counts(&pairs, "/Users/s/tmp"), (3, 3));
+        // A single-project pattern: descendant rows are distinct project dirs.
+        assert_eq!(preview_counts(&pairs, "stu_1340"), (2, 2));
+        assert_eq!(preview_counts(&pairs, "nonexistent"), (0, 0));
     }
 
     #[test]
@@ -1933,7 +2303,9 @@ pub fn run() {
         .format_timestamp_secs()
         .init();
 
-    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init());
     // ponytail: WebDriver plugin is E2E-only, gated to debug builds. It still links into
     // the release binary but never initializes; ceiling — make it an optional cargo
     // feature enabled only in dev to strip it from release entirely.
@@ -1945,6 +2317,7 @@ pub fn run() {
             reindex,
             index_status,
             list_sessions,
+            list_threads,
             get_session_detail,
             search_recaps,
             digest,
@@ -1956,9 +2329,16 @@ pub fn run() {
             list_blacklist,
             add_blacklist_pattern,
             remove_blacklist_pattern,
+            preview_blacklist_pattern,
             tag_session,
             update_session_tags,
+            backfill_tags,
             set_kanban,
+            get_timeline,
+            digest_session,
+            digest_pending,
+            link_threads,
+            update_session_digest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1999,6 +2379,7 @@ mod serde_tests {
             manual_fields: vec!["completionPct".into()],
             kanban_status: Some("inProgress".into()),
             kanban_order: Some(1.5),
+            next_action: Some("wire the frontend".into()),
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"projectDir\""), "expected camelCase projectDir, got: {}", json);
@@ -2015,6 +2396,7 @@ mod serde_tests {
         assert!(json.contains("\"manualFields\""));
         assert!(json.contains("\"kanbanStatus\""));
         assert!(json.contains("\"kanbanOrder\""));
+        assert!(json.contains("\"nextAction\""));
         assert!(!json.contains("area_of_life"), "snake_case leaked: {}", json);
     }
 

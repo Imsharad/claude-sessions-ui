@@ -34,7 +34,8 @@ pub fn open() -> rusqlite::Result<Connection> {
 }
 
 /// Idempotent schema creation. All `CREATE IF NOT EXISTS` so re-running is safe.
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+/// pub(crate) so integration-style tests can land the real schema on a temp DB.
+pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // NOTE: keep field names stable — frontend & indexer depend on them.
     conn.execute_batch(
         r#"
@@ -149,6 +150,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     migrate_v1(conn)?;
     migrate_v2(conn)?;
     migrate_v3(conn)?;
+    migrate_v4(conn)?;
     Ok(())
 }
 
@@ -234,6 +236,60 @@ fn migrate_v3(conn: &Connection) -> rusqlite::Result<()> {
         "skipped_count INTEGER DEFAULT 0",
     )?;
     conn.pragma_update(None, "user_version", 3)?;
+    Ok(())
+}
+
+/// v4: Timeline digest schema (P6). Three additive tables, all `CREATE IF NOT
+/// EXISTS` so an interrupted run re-runs clean, then bump user_version to 4. The
+/// LLM only ever fills `session_digests` slots + a `threads`/`thread_members`
+/// linking pass; deterministic facts (day grouping, counts) stay in SQL. Every
+/// row references `sessions(id)` ON DELETE CASCADE, so a re-index that drops a
+/// session takes its digest + thread membership with it — no orphan provenance.
+fn migrate_v4(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 4 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
+        -- One per-session digest slot. LLM output is untrusted: schema-validated
+        -- + referentially checked in Rust before it lands here. content_hash
+        -- (FNV-1a over the final recap uuid + content + prompt_version + model)
+        -- gates regeneration; manual_fields (JSON array of hand-edited field
+        -- names) protects hand-edits from auto-regeneration.
+        CREATE TABLE IF NOT EXISTS session_digests (
+            session_id     TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            content_hash   TEXT NOT NULL,
+            prompt_version INTEGER NOT NULL,
+            model          TEXT,
+            worked_on      TEXT,
+            outcome        TEXT,
+            open_loops     TEXT,        -- JSON array of strings, max 3
+            citations      TEXT,        -- JSON array of strings, may be empty
+            verified       INTEGER DEFAULT 1,
+            confidence     REAL,
+            generated_at   TEXT,
+            manual_fields  TEXT         -- JSON array of hand-edited field names
+        );
+
+        -- A narrative thread linking sessions across days. Members live in
+        -- thread_members; a session may reference only existing rows (the
+        -- linking pass validates every member id against the input set).
+        CREATE TABLE IF NOT EXISTS threads (
+            id             TEXT PRIMARY KEY,    -- uuid
+            arc            TEXT,                -- one-line narrative
+            prompt_version INTEGER NOT NULL,
+            generated_at   TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS thread_members (
+            thread_id  TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            PRIMARY KEY (thread_id, session_id)
+        );
+        "#,
+    )?;
+    conn.pragma_update(None, "user_version", 4)?;
     Ok(())
 }
 
@@ -370,9 +426,9 @@ mod tests {
         migrate(&conn).unwrap();
 
         // user_version bumped to the latest applied migration (v1 schema + v2 heal
-        // + v3 blacklist skip-tally column).
+        // + v3 blacklist skip-tally column + v4 digest tables).
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
 
         // Blacklist table exists and is seeded exactly once
         let patterns = load_blacklist_patterns(&conn);
@@ -418,7 +474,7 @@ mod tests {
         // leave every user-curated field intact.
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
 
         let (mtime, area, pct, kanban): (i64, Option<String>, Option<i64>, Option<String>) = conn
             .query_row(
@@ -437,5 +493,72 @@ mod tests {
         migrate(&conn).unwrap();
         let mtime2: i64 = conn.query_row("SELECT file_mtime FROM sessions WHERE id='s1'", [], |r| r.get(0)).unwrap();
         assert_eq!(mtime2, 1700000001, "v2 must not re-run once user_version >= 2");
+    }
+
+    #[test]
+    fn migrate_v4_lands_digest_tables_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Cascade only fires with FK enforcement on — db::open sets this pragma,
+        // but a bare in-memory connection does not, so enable it here.
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4);
+
+        // A session to hang a digest + thread off of (FK targets must exist).
+        conn.execute(
+            "INSERT INTO sessions (id, file_path, file_mtime) VALUES ('s1', '/tmp/x.jsonl', 1)",
+            [],
+        )
+        .unwrap();
+
+        // session_digests round-trips; `verified` defaults to 1.
+        conn.execute(
+            "INSERT INTO session_digests (session_id, content_hash, prompt_version, worked_on)
+             VALUES ('s1', 'deadbeef', 1, 'refactored the indexer')",
+            [],
+        )
+        .unwrap();
+        let (worked, verified): (String, i64) = conn
+            .query_row(
+                "SELECT worked_on, verified FROM session_digests WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(worked, "refactored the indexer");
+        assert_eq!(verified, 1, "verified defaults to 1");
+
+        // threads + thread_members, with cascade from threads.
+        conn.execute(
+            "INSERT INTO threads (id, arc, prompt_version) VALUES ('t1', 'a workstream', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thread_members (thread_id, session_id) VALUES ('t1', 's1')",
+            [],
+        )
+        .unwrap();
+        let n_members: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread_members", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_members, 1);
+
+        // Deleting the thread cascades its membership away.
+        conn.execute("DELETE FROM threads WHERE id='t1'", []).unwrap();
+        let n_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread_members", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_after, 0, "thread_members cascades on thread delete");
+
+        // Re-running migrate is a no-op: version holds, rows survive.
+        migrate(&conn).unwrap();
+        let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v2, 4);
+        let n_digests: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_digests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_digests, 1, "idempotent migrate must not drop rows");
     }
 }

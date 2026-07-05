@@ -9,9 +9,10 @@
  *        muted zero-count lines. If the window would overflow one viewport,
  *        the oldest days collapse behind a single "earlier" row — threads never
  *        collapse.
- *   L1 — a day expands (click/Enter) to one line per session: title, project
- *        tail, time, and the digest worked-on line (or a muted "no digest"
- *        state with a small Digest action).
+ *   L1 — a day expands (click/Enter) to project clusters, each collapsing past
+ *        COLLAPSE_THRESHOLD sessions. A session row: title, project tail, time,
+ *        and the digest worked-on line. The per-row Digest action is
+ *        hover-revealed (group-hover/group-focus-within); no "no digest" text.
  *   L2 — a session expands to the full digest card (worked-on / outcome /
  *        open loops, provenance markers, inline edit, retry) — the pre-existing
  *        card relocated one level deeper, not rewritten.
@@ -65,6 +66,12 @@ const GAP_ROW_PX = 26;
 const BODY_CHROME_PX = 56; // body padding + threads/days separation
 const MIN_VISIBLE_DAYS = 3;
 
+// Sessions per project cluster before the tail collapses behind "show N more".
+// A 25-session / 4-project day then reads as four scannable clusters, not a
+// flat endless scroll of leaf rows — the same skeleton the L0 collapse gives
+// across days, one level down.
+const COLLAPSE_THRESHOLD = 5;
+
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 type Announce = (message: string, kind?: "polite" | "assertive") => void;
@@ -81,6 +88,7 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
   const [resp, setResp] = useState<TimelineResponse | null>(null);
   const [digests, setDigests] = useState<Record<string, SessionDigest>>({});
   const [threads, setThreads] = useState<Thread[]>([]);
+  const [metaSessionIds, setMetaSessionIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -89,10 +97,16 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
   // null = idle, "running" = backfill in flight, report = last finished counts.
   const [weekRun, setWeekRun] = useState<null | "running" | DigestBatchReport>(null);
 
-  // Disclosure state — keyed by date / sessionId (never array index) so it
-  // survives window resizes and "Digest week" refreshes.
+  // Disclosure state — keyed by date / sessionId / `${date}:${project}` (never
+  // array index) so it survives window resizes and "Digest week" refreshes.
   const [expandedDays, setExpandedDays] = useState<Set<string>>(new Set());
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set());
+  // A cluster is in this set when the USER has toggled it expanded past the
+  // COLLAPSE_THRESHOLD cutoff. Absent = default (collapsed past threshold).
+  const [expandedClusters, setExpandedClusters] = useState<Set<string>>(new Set());
+  // "App activity" group (meta/harness sessions) — collapsed by default; only
+  // expands on user action. Separate from day rows/totals (FIX 3).
+  const [showAppActivity, setShowAppActivity] = useState(false);
   const [showEarlier, setShowEarlier] = useState(false);
 
   // Roving focus: one row carries tabIndex 0; arrows move focus among rows.
@@ -125,6 +139,7 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
       setResp(r);
       setDigests(r.digests ?? {});
       setThreads(r.threads ?? []);
+      setMetaSessionIds(r.metaSessionIds ?? []);
     } catch (e) {
       setError(asTagError(e).message);
     } finally {
@@ -152,6 +167,7 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
       const r = await getTimeline(days);
       setResp(r);
       setDigests(r.digests ?? {});
+      setMetaSessionIds(r.metaSessionIds ?? []);
       const t = await linkThreads(days);
       setThreads(t);
       announce(`Week digested: ${report.generated} new, ${report.cached} cached`);
@@ -177,6 +193,16 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleCluster = useCallback((date: string, project: string) => {
+    const key = `${date}:${project}`;
+    setExpandedClusters((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   }, []);
@@ -312,6 +338,28 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
   const dayIdsOf = (date: string) =>
     orderedDays.find((d) => d.date === date)?.sessionIds.filter(passes) ?? [];
 
+  // Within-day grouping by project — kills the L1 flat-scroll regression. The
+  // day header already derives `projects.size` the same way; here we keep
+  // first-appearance order (post-FIX-4 = last-activity-descending) so the
+  // most-recently-touched project tops the day. Project key mirrors the L1 row.
+  const projectKeyOf = (id: string) => {
+    const c = cardById.get(id);
+    return c ? c.projectShortName ?? c.displayProject : "unknown";
+  };
+  const clusterByProject = (ids: string[]) => {
+    const order: string[] = [];
+    const groups = new Map<string, string[]>();
+    for (const id of ids) {
+      const key = projectKeyOf(id);
+      if (!groups.has(key)) {
+        groups.set(key, []);
+        order.push(key);
+      }
+      groups.get(key)!.push(id);
+    }
+    return order.map((key) => ({ key, ids: groups.get(key)! }));
+  };
+
   // One keyboard contract for every level. Text inputs opt out (inline edit
   // owns its own Enter/Escape); Escape from inside an expanded region always
   // returns focus to the row that owned the disclosure.
@@ -416,7 +464,7 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
     requestAnimationFrame(() => focusRow(firstHidden ? `day:${firstHidden.date}` : null));
   };
 
-  const renderSessionRow = (id: string, inlineLoops: boolean) => (
+  const renderSessionRow = (id: string, inlineLoops: boolean, showProject = true) => (
     <SessionRow
       key={id}
       sessionId={id}
@@ -433,6 +481,7 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
       announce={announce}
       inlineLoops={inlineLoops}
       transition={regionTransition}
+      showProject={showProject}
     />
   );
 
@@ -606,7 +655,7 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
                           {weekday}
                         </span>
                         <span className="shrink-0 text-[11.5px] text-ink-3">{dateLabel}</span>
-                        <span className="min-w-0 flex-1 truncate text-right text-[11.5px] tabular-nums text-ink-3">
+                        <span className="min-w-0 flex-1 truncate text-right text-[12.5px] font-semibold tabular-nums text-ink-2">
                           {composite}
                         </span>
                       </button>
@@ -624,8 +673,28 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
                             transition={regionTransition}
                             className="overflow-hidden"
                           >
-                            <div className="ml-[15px] space-y-0.5 border-l border-border py-1 pl-3">
-                              {ids.map((id) => renderSessionRow(id, false))}
+                            <div className="ml-[15px] space-y-1 border-l border-border py-1 pl-3">
+                              {(() => {
+                                const clusters = clusterByProject(ids);
+                                // One project → no cluster header, just the rows.
+                                // The cluster spine is redundant when there's
+                                // nothing to disambiguate.
+                                if (clusters.length === 1) {
+                                  return clusters[0].ids.map((id) =>
+                                    renderSessionRow(id, false, false),
+                                  );
+                                }
+                                return clusters.map(({ key, ids: cIds }) => (
+                                  <ProjectCluster
+                                    key={key}
+                                    projectKey={key}
+                                    ids={cIds}
+                                    expanded={expandedClusters.has(`${day.date}:${key}`)}
+                                    onToggle={() => toggleCluster(day.date, key)}
+                                    renderRow={renderSessionRow}
+                                  />
+                                ));
+                              })()}
                             </div>
                           </motion.div>
                         )}
@@ -648,6 +717,47 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
                     Show {plural(hiddenDays.length, "earlier day")}
                     {hiddenSessionTotal > 0 ? ` · ${plural(hiddenSessionTotal, "session")}` : ""}
                   </button>
+                )}
+
+                {/* App activity — harness/self sessions the timeline spawned
+                    (triage, digest, grouping calls). Filtered out of every day
+                    and total above; surfaced here, collapsed by default, only
+                    when present and the view isn't filtered. Never counted in
+                    the day summary's sessions/open-loops totals. */}
+                {metaSessionIds.length > 0 && (
+                  <div className="mt-2 border-t border-border/60 pt-1">
+                    <button
+                      onClick={() => setShowAppActivity((v) => !v)}
+                      aria-expanded={showAppActivity}
+                      className="flex min-h-[28px] w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11.5px] text-ink-3 transition hover:bg-surface-2/60 hover:text-ink-2"
+                    >
+                      <ChevronRight
+                        size={12}
+                        aria-hidden
+                        className={`shrink-0 text-ink-4 transition-transform ${showAppActivity ? "rotate-90" : ""}`}
+                      />
+                      App activity
+                      <span className="tabular-nums text-ink-4">
+                        · {plural(metaSessionIds.length, "hidden session")}
+                      </span>
+                    </button>
+                    <AnimatePresence initial={false}>
+                      {showAppActivity && (
+                        <motion.div
+                          key="app-activity"
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={regionTransition}
+                          className="overflow-hidden"
+                        >
+                          <div className="ml-[15px] space-y-0.5 border-l border-border/60 py-1 pl-3">
+                            {metaSessionIds.map((id) => renderSessionRow(id, false, true))}
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </div>
                 )}
               </div>
             )}
@@ -706,19 +816,21 @@ function ThreadLine({
       }`}
     >
       <span
-        className={`min-w-0 flex-1 truncate text-[12px] leading-snug ${
-          active ? "font-medium text-accent-strong" : "text-ink-2"
+        className={`min-w-0 flex-1 truncate text-[12.5px] leading-snug ${
+          active ? "font-medium text-accent-strong" : "font-medium text-ink"
         }`}
       >
         {thread.arc}
       </span>
-      <span className="shrink-0 text-[10.5px] tabular-nums text-ink-4">
+      <span className="shrink-0 text-[10.5px] tabular-nums text-ink-3">
         {plural(thread.memberSessionIds.length, "session")}
       </span>
-      <span aria-hidden className="flex shrink-0 items-center gap-[3px]">
+      <span className="flex shrink-0 items-center gap-[3px]">
+        <span className="sr-only">active {activeLabels || "no days"}</span>
         {windowDatesAsc.map((dt) => (
           <span
             key={dt}
+            aria-hidden
             className={`h-[5px] w-[5px] rounded-full ${
               memberDates.has(dt) ? "bg-accent" : "bg-border"
             }`}
@@ -747,6 +859,7 @@ function SessionRow({
   announce,
   inlineLoops,
   transition,
+  showProject = true,
 }: {
   sessionId: string;
   card: SessionCard | undefined;
@@ -762,6 +875,9 @@ function SessionRow({
   announce: Announce;
   inlineLoops: boolean;
   transition: typeof SPRING | { duration: number };
+  /** Show the per-row project tail. Off inside a project cluster (the cluster
+   *  header already establishes the project — show it once, not N times). */
+  showProject?: boolean;
 }) {
   const title = card?.title || "(untitled session)";
   const projectTail = card ? card.projectShortName ?? card.displayProject : sessionId.slice(0, 8);
@@ -769,7 +885,7 @@ function SessionRow({
 
   return (
     <div>
-      <div className="flex items-center gap-1.5">
+      <div className="group flex items-center gap-1.5">
         <button
           data-trow={`sess:${sessionId}`}
           ref={refCb}
@@ -790,18 +906,18 @@ function SessionRow({
           <span className="max-w-[220px] shrink-0 truncate text-[12.5px] font-medium text-ink">
             {title}
           </span>
-          <span className="max-w-[110px] shrink-0 truncate text-[11px] text-ink-3">
-            {projectTail}
-          </span>
+          {showProject && (
+            <span className="max-w-[110px] shrink-0 truncate text-[11px] text-ink-3">
+              {projectTail}
+            </span>
+          )}
           <span className="shrink-0 text-[11px] tabular-nums text-ink-4">
             {relativeTime(card?.lastTs ?? null)}
           </span>
-          {digest ? (
+          {digest && (
             <span className="min-w-0 flex-1 truncate text-[12px] text-ink-2">
               {digest.workedOn}
             </span>
-          ) : (
-            <span className="text-[11px] italic text-ink-4">no digest</span>
           )}
         </button>
         {!digest && (
@@ -852,6 +968,73 @@ function SessionRow({
           </motion.div>
         )}
       </AnimatePresence>
+    </div>
+  );
+}
+
+/** Within-day project cluster — groups a day's sessions by project so a
+ *  25-session / 4-project day reads as four scannable clusters, not a flat
+ *  endless scroll. The project label appears ONCE here (per FIX 2); rows inside
+ *  hide their per-row project tail. Collapses past COLLAPSE_THRESHOLD with a
+ *  "show N more" affordance (default collapsed). Mirrors the day-row disclosure
+ *  pattern: chevron + spine, AnimatePresence + the shared spring. */
+function ProjectCluster({
+  projectKey,
+  ids,
+  expanded,
+  onToggle,
+  renderRow,
+}: {
+  projectKey: string;
+  ids: string[];
+  expanded: boolean;
+  onToggle: () => void;
+  renderRow: (id: string, inlineLoops: boolean, showProject?: boolean) => React.ReactNode;
+}) {
+  const overThreshold = ids.length > COLLAPSE_THRESHOLD;
+  // Default-collapsed past threshold; the user-expand set inverts that.
+  const collapsed = overThreshold && !expanded;
+  const visible = collapsed ? ids.slice(0, COLLAPSE_THRESHOLD) : ids;
+  const hiddenCount = ids.length - visible.length;
+
+  return (
+    <div>
+      <button
+        onClick={onToggle}
+        aria-expanded={!collapsed}
+        className="group/cluster flex min-h-[28px] w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left transition hover:bg-surface-2/60"
+      >
+        <ChevronRight
+          size={11}
+          aria-hidden
+          className={`shrink-0 text-ink-4 transition-transform ${collapsed ? "" : "rotate-90"}`}
+        />
+        <span className="max-w-[180px] shrink-0 truncate text-[11.5px] font-semibold text-ink">
+          {projectKey}
+        </span>
+        <span className="shrink-0 text-[10.5px] tabular-nums text-ink-4">
+          {plural(ids.length, "session")}
+        </span>
+      </button>
+      <div className="ml-[7px] space-y-0.5 border-l border-border/70 py-0.5 pl-2.5">
+        {visible.map((id) => renderRow(id, false, false))}
+        {collapsed && hiddenCount > 0 && (
+          <button
+            onClick={onToggle}
+            className="ml-1 rounded-sm px-1.5 py-1 text-left text-[11px] text-ink-3 transition hover:bg-surface-2/60 hover:text-ink-2"
+          >
+            show {hiddenCount} more
+          </button>
+        )}
+        {!collapsed && overThreshold && (
+          <button
+            onClick={onToggle}
+            className="ml-1 rounded-sm px-1.5 py-1 text-left text-[11px] text-ink-3 transition hover:bg-surface-2/60 hover:text-ink-2"
+          >
+            show less
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -911,7 +1094,9 @@ function DigestAction({
       onClick={run}
       disabled={busy}
       title={`Generate a digest for ${title}`}
-      className="inline-flex min-h-[32px] shrink-0 items-center gap-1 rounded-sm border border-border bg-surface px-2 text-[11px] font-medium text-ink-2 shadow-xs transition hover:border-border-strong hover:text-ink disabled:opacity-50"
+      className={`inline-flex min-h-[32px] shrink-0 items-center gap-1 rounded-sm px-1.5 text-[11px] font-medium text-ink-3 transition hover:text-ink hover:bg-surface-2/60 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:text-ink disabled:opacity-100 ${
+        busy ? "opacity-100" : "opacity-0"
+      }`}
     >
       {busy ? (
         <Loader2 size={11} className="animate-spin text-accent" />

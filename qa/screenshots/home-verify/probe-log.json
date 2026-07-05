@@ -1,0 +1,36 @@
+[
+  {
+    "step": "01-home-default",
+    "browseAll": "Browse all 213 sessions",
+    "compactResumeCount": 2,
+    "forkBtn": true,
+    "heroName": ".brain",
+    "heroResume": true,
+    "launcherHeader": false,
+    "leftOff": false,
+    "orientation": true,
+    "orientationText": "Sunday, July 5 — 18 threads active this week.",
+    "searchInput": true,
+    "whySnippets": [
+      "Last active 4 hours ago; last session at 50% complete.",
+      "Last active 12 minutes ago; active 12 of the last 14 days.",
+      "Last active 19 hours ago; last session at 75% complete."
+    ]
+  },
+  {
+    "step": "02-exit-search",
+    "hasSessionHeader": true,
+    "topSearchValue": "refactor"
+  },
+  {
+    "step": "03-back-home",
+    "heroName": ".brain"
+  },
+  {
+    "step": "04-secondary-row",
+    "found": true,
+    "name": "sharad",
+    "inBrowse": true,
+    "sidebarSelected": "sharad~76"
+  }
+]

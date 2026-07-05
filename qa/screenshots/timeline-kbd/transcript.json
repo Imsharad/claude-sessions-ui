@@ -1,0 +1,127 @@
+[
+  {
+    "step": "L0 default render (no interaction yet)",
+    "cardVisible": false,
+    "dayRows": 7,
+    "expandedRegions": [],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": null,
+    "focusedRow": "<body>",
+    "l0Fits": true,
+    "threadRows": 0
+  },
+  {
+    "step": "focus roving tab stop",
+    "cardVisible": false,
+    "dayRows": 7,
+    "expandedRegions": [],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": "false",
+    "focusedRow": "day:2026-07-05",
+    "l0Fits": true,
+    "threadRows": 0,
+    "keys": "(Tab lands here — one stop for all rows)"
+  },
+  {
+    "step": "Enter on day row -> expands to L1",
+    "cardVisible": false,
+    "dayRows": 7,
+    "expandedRegions": [
+      "day:2026-07-05"
+    ],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": "true",
+    "focusedRow": "day:2026-07-05",
+    "l0Fits": false,
+    "threadRows": 0,
+    "keys": "Enter",
+    "firstRowTopBefore": 120
+  },
+  {
+    "step": "ArrowDown -> first session row (L1)",
+    "cardVisible": false,
+    "dayRows": 7,
+    "expandedRegions": [
+      "day:2026-07-05"
+    ],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": "false",
+    "focusedRow": "sess:9a8c90f2-5b43-4998-a0a9-2fff5f77dfb9",
+    "l0Fits": false,
+    "threadRows": 0,
+    "keys": "ArrowDown"
+  },
+  {
+    "step": "Enter on session row -> expands to L2 card",
+    "cardVisible": true,
+    "dayRows": 7,
+    "expandedRegions": [
+      "day:2026-07-05",
+      "sess:9a8c90f2-5b43-4998-a0a9-2fff5f77dfb9"
+    ],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": "true",
+    "focusedRow": "sess:9a8c90f2-5b43-4998-a0a9-2fff5f77dfb9",
+    "l0Fits": false,
+    "threadRows": 0,
+    "keys": "Enter"
+  },
+  {
+    "step": "Escape -> collapses L2, focus stays on session row",
+    "cardVisible": true,
+    "dayRows": 7,
+    "expandedRegions": [
+      "day:2026-07-05",
+      "sess:9a8c90f2-5b43-4998-a0a9-2fff5f77dfb9"
+    ],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": "false",
+    "focusedRow": "sess:9a8c90f2-5b43-4998-a0a9-2fff5f77dfb9",
+    "l0Fits": false,
+    "threadRows": 0,
+    "keys": "Escape"
+  },
+  {
+    "step": "ArrowLeft on collapsed session -> focus owner day row",
+    "cardVisible": true,
+    "dayRows": 7,
+    "expandedRegions": [
+      "day:2026-07-05",
+      "sess:9a8c90f2-5b43-4998-a0a9-2fff5f77dfb9"
+    ],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": "true",
+    "focusedRow": "day:2026-07-05",
+    "l0Fits": false,
+    "threadRows": 0,
+    "keys": "ArrowLeft"
+  },
+  {
+    "step": "ArrowLeft on day row -> collapses L1, focus stays",
+    "cardVisible": false,
+    "dayRows": 7,
+    "expandedRegions": [
+      "day:2026-07-05"
+    ],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": "false",
+    "focusedRow": "day:2026-07-05",
+    "l0Fits": true,
+    "threadRows": 0,
+    "keys": "ArrowLeft"
+  },
+  {
+    "step": "ArrowUp -> previous visible row",
+    "cardVisible": false,
+    "dayRows": 7,
+    "expandedRegions": [
+      "day:2026-07-05"
+    ],
+    "firstRowTop": 120,
+    "focusedAriaExpanded": "false",
+    "focusedRow": "day:2026-07-05",
+    "l0Fits": true,
+    "threadRows": 0,
+    "keys": "ArrowUp"
+  }
+]

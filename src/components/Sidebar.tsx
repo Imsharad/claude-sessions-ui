@@ -10,13 +10,15 @@
  */
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { Search, Star, Folder, Hash, EyeOff, X, Plus } from "lucide-react";
-import type { SessionCard, BlacklistEntry } from "../lib/ipc";
+import type { SessionCard, BlacklistEntry, BlacklistPreview } from "../lib/ipc";
 import {
   togglePin,
   listBlacklist,
   addBlacklistPattern,
   removeBlacklistPattern,
+  previewBlacklistPattern,
 } from "../lib/ipc";
 import { shortCwd } from "../lib/format";
 
@@ -36,7 +38,9 @@ interface SidebarProps {
   query: string;
   onQueryChange: (q: string) => void;
   onPinnedChange: () => void; // refresh after pin toggle
-  onBlacklistChange: () => void; // refresh sessions after a hide/unhide
+  // Refresh sessions after a hide/unhide. rescan=true reindexes first —
+  // required on unhide, since scan-skipped sessions were never indexed.
+  onBlacklistChange: (rescan?: boolean) => void | Promise<void>;
 }
 
 export function Sidebar({
@@ -56,10 +60,25 @@ export function Sidebar({
   const [blacklist, setBlacklist] = useState<BlacklistEntry[]>([]);
   const [newPattern, setNewPattern] = useState("");
   const [hiddenError, setHiddenError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<BlacklistPreview | null>(null);
 
   useEffect(() => {
     listBlacklist().then(setBlacklist).catch((e) => console.error("blacklist load failed", e));
   }, []);
+
+  // Live preview of what the typed pattern would hide, debounced so we don't
+  // round-trip on every keystroke.
+  useEffect(() => {
+    const p = newPattern.trim();
+    if (!p) {
+      setPreview(null);
+      return;
+    }
+    const t = setTimeout(() => {
+      previewBlacklistPattern(p).then(setPreview).catch(() => setPreview(null));
+    }, 250);
+    return () => clearTimeout(t);
+  }, [newPattern]);
 
   const handleAddHidden = async () => {
     try {
@@ -72,11 +91,56 @@ export function Sidebar({
     }
   };
 
+  // Native folder picker — the zero-syntax way to hide whole trees. macOS
+  // allows multi-select, so several parent dirs land in one gesture; each
+  // picked dir becomes its own pattern (individually removable later).
+  const handlePickFolders = async () => {
+    try {
+      const picked = await openDialog({
+        directory: true,
+        multiple: true,
+        title: "Hide sessions under these folders",
+      });
+      if (!picked) return; // cancelled
+      const dirs = Array.isArray(picked) ? picked : [picked];
+      let list = blacklist;
+      for (const d of dirs) list = await addBlacklistPattern(d);
+      setBlacklist(list);
+      setHiddenError(null);
+      // Deselect if the active project filter just vanished under a picked dir.
+      const selCwd = sessions.find((s) => s.projectDir === selectedProject)?.cwd;
+      if (selCwd && dirs.some((d) => `${selCwd}/`.startsWith(`${d.replace(/\/+$/, "")}/`))) {
+        onSelectProject(null);
+      }
+      onBlacklistChange();
+    } catch (e) {
+      setHiddenError(String(e));
+    }
+  };
+
+  // One-click hide from a project row: the row's own cwd is the pattern, so
+  // no glob syntax is involved. Deselect first if the hidden project is the
+  // active filter — otherwise the list would sit on an invisible project.
+  const handleHideProject = async (g: ProjectGroup) => {
+    try {
+      setBlacklist(await addBlacklistPattern(g.cwd));
+      setHiddenError(null);
+      if (selectedProject === g.projectDir) onSelectProject(null);
+      onBlacklistChange();
+    } catch (e) {
+      setHiddenError(String(e));
+      setShowHidden(true); // the error renders inside the panel
+    }
+  };
+
   const handleRemoveHidden = async (pattern: string) => {
     try {
       setBlacklist(await removeBlacklistPattern(pattern));
       setHiddenError(null);
-      onBlacklistChange();
+      // Rescan: sessions created while the tree was hidden were never indexed.
+      await onBlacklistChange(true);
+      // Counts of remaining patterns can shift once the rescan lands.
+      setBlacklist(await listBlacklist());
     } catch (e) {
       setHiddenError(String(e));
     }
@@ -130,12 +194,12 @@ export function Sidebar({
 
         {pinned.length > 0 && <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">Pinned</div>}
         {pinned.map((g) => (
-          <ProjectItem key={g.projectDir} active={selectedProject === g.projectDir} onClick={() => onSelectProject(g.projectDir)} icon={<Star size={14} className="fill-warn text-warn" />} label={g.display} sublabel={shortCwd(g.cwd)} count={g.count} onPin={() => handlePin(g.projectDir)} pinned />
+          <ProjectItem key={g.projectDir} active={selectedProject === g.projectDir} onClick={() => onSelectProject(g.projectDir)} icon={<Star size={14} className="fill-warn text-warn" />} label={g.display} sublabel={shortCwd(g.cwd)} count={g.count} onPin={() => handlePin(g.projectDir)} pinned onHide={() => handleHideProject(g)} />
         ))}
 
         <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">Projects {others.length > 12 && !showAll && `(${others.length})`}</div>
         {visibleOthers.map((g) => (
-          <ProjectItem key={g.projectDir} active={selectedProject === g.projectDir} onClick={() => onSelectProject(g.projectDir)} icon={<Folder size={14} className="text-ink-3" />} label={g.display} sublabel={shortCwd(g.cwd)} count={g.count} onPin={() => handlePin(g.projectDir)} />
+          <ProjectItem key={g.projectDir} active={selectedProject === g.projectDir} onClick={() => onSelectProject(g.projectDir)} icon={<Folder size={14} className="text-ink-3" />} label={g.display} sublabel={shortCwd(g.cwd)} count={g.count} onPin={() => handlePin(g.projectDir)} onHide={() => handleHideProject(g)} />
         ))}
         {others.length > 12 && (
           <button onClick={() => setShowAll((v) => !v)} className="mt-1 w-full rounded-sm px-3 py-1.5 text-left text-[12px] text-ink-3 transition hover:bg-surface-3 hover:text-ink-2">
@@ -173,7 +237,8 @@ export function Sidebar({
               <div className="pt-1">
                 {blacklist.length === 0 ? (
                   <p className="px-3 py-1.5 text-[11.5px] leading-snug text-ink-4">
-                    Add a pattern to hide a project tree from tracking.
+                    Declutter: choose folders to hide, or hover a project and
+                    click the eye.
                   </p>
                 ) : (
                   blacklist.map((b) => (
@@ -198,6 +263,15 @@ export function Sidebar({
                   ))
                 )}
 
+                <button
+                  onClick={handlePickFolders}
+                  className="mt-1.5 flex w-[calc(100%-16px)] items-center gap-2 rounded border border-dashed border-border px-3 py-1.5 mx-2 text-[12px] font-medium text-ink-3 transition hover:bg-surface-3 hover:text-ink-2"
+                  title="Pick one or more folders; sessions under them are hidden"
+                >
+                  <Folder size={13} />
+                  Choose folders to hide…
+                </button>
+
                 <form
                   onSubmit={(e) => {
                     e.preventDefault();
@@ -219,6 +293,14 @@ export function Sidebar({
                     <Plus size={14} />
                   </button>
                 </form>
+
+                {newPattern.trim() !== "" && preview && (
+                  <p className="mt-1 px-3 text-[11px] text-ink-4">
+                    {preview.sessionCount > 0
+                      ? `Will hide ${preview.projectCount} project${preview.projectCount === 1 ? "" : "s"} · ${preview.sessionCount} session${preview.sessionCount === 1 ? "" : "s"}`
+                      : "Matches nothing currently indexed"}
+                  </p>
+                )}
 
                 {hiddenError && (
                   <p className="mt-1 px-3 text-[11px] text-danger">{hiddenError}</p>
@@ -242,6 +324,7 @@ interface ProjectItemProps {
   countStyle?: "default" | "muted";
   pinned?: boolean;
   onPin?: () => void;
+  onHide?: () => void;
 }
 
 function ProjectItem({
@@ -254,7 +337,9 @@ function ProjectItem({
   countStyle = "default",
   pinned,
   onPin,
+  onHide,
 }: ProjectItemProps) {
+  const hasActions = Boolean(onPin || onHide);
   return (
     <div
       onClick={onClick}
@@ -276,16 +361,31 @@ function ProjectItem({
       {count !== undefined && (
         <span
           className={
-            countStyle === "muted"
+            (countStyle === "muted"
               ? "text-[11px] tabular-nums text-ink-4"                    // muted: bare number, no pill
               : "rounded-full px-1.5 py-0.5 text-[10px] font-medium tabular-nums " +
                 (active
                   ? "bg-accent/15 text-accent-strong"
-                  : "bg-surface-3 text-ink-3")
+                  : "bg-surface-3 text-ink-3")) +
+            // The hover actions land where the count sits; fade it out so the
+            // two never overlap.
+            (hasActions ? " transition group-hover:opacity-0" : "")
           }
         >
           {count}
         </span>
+      )}
+      {onHide && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onHide();
+          }}
+          className="absolute right-6 opacity-0 transition group-hover:opacity-100"
+          title="Hide this project"
+        >
+          <EyeOff size={12} className="text-ink-4 hover:text-ink-2" />
+        </button>
       )}
       {onPin && (
         <button

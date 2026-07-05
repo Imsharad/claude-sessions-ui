@@ -74,6 +74,10 @@ export interface SessionCard {
   manualFields: string[];
   kanbanStatus: string | null;
   kanbanOrder: number | null;
+  /** The session's stated next step, derived at read time from the final recap's
+   *  text. Only get_session_detail populates it (detail.card.nextAction); the list
+   *  query leaves it null. Null when no next-step marker is found. */
+  nextAction: string | null;
 }
 
 export interface Recap {
@@ -140,6 +144,69 @@ export interface DigestEntry {
   messageCount: number;
 }
 
+// ─── Timeline digest (P6) ─────────────────────────────────────────────
+// A read-only weekly reconstruction surface. get_timeline is instant (no LLM);
+// per-session digests are generate-or-cached over the same TagError channel as
+// tagging (asTagError()). Manual edits durably override generated fields.
+
+/** One session's digest row. Renders truthfully even when generated: `verified`
+ *  / `confidence` drive quiet-vs-confident styling, `stale` flags a source that
+ *  changed after generation, `manualFields` lists hand-edited fields (accent-dot
+ *  marked, never overwritten by regeneration). */
+export interface SessionDigest {
+  sessionId: string;
+  workedOn: string;
+  outcome: string;
+  openLoops: string[];
+  citations: string[];
+  verified: boolean;
+  confidence: number | null;
+  model: string | null;
+  promptVersion: number;
+  generatedAt: string | null;
+  stale: boolean;
+  manualFields: string[];
+}
+
+/** One day in the window. Gap days arrive as sessionCount 0 with empty
+ *  sessionIds — a truthful zero, never invented activity. */
+export interface TimelineDay {
+  date: string; // YYYY-MM-DD
+  sessionCount: number;
+  sessionIds: string[];
+}
+
+/** A multi-day workstream linking sessions by arc. */
+export interface Thread {
+  id: string;
+  arc: string;
+  memberSessionIds: string[];
+  generatedAt: string | null;
+}
+
+/** Everything the timeline needs in one round-trip: the day skeleton, the
+ *  digests keyed by sessionId, and the linked threads. */
+export interface TimelineResponse {
+  days: TimelineDay[];
+  digests: Record<string, SessionDigest>;
+  threads: Thread[];
+}
+
+/** Result of a batch backfill over the window. */
+export interface DigestBatchReport {
+  generated: number;
+  cached: number;
+  failed: number;
+  skippedNoRecap: number;
+}
+
+/** Fields a hand-edit can patch on a digest (each becomes durable/manual). */
+export interface DigestPatch {
+  workedOn?: string;
+  outcome?: string;
+  openLoops?: string[];
+}
+
 export interface GlobalStats {
   totalSessions: number;
   totalMessages: number;
@@ -180,6 +247,13 @@ export interface BlacklistEntry {
   matchCount: number;
 }
 
+/** What a candidate pattern would hide, over indexed sessions only. Mirrors
+ *  BlacklistPreview in lib.rs. */
+export interface BlacklistPreview {
+  projectCount: number;
+  sessionCount: number;
+}
+
 /** The controlled area-of-life vocabulary (mirrors AREAS_OF_LIFE in lib.rs). */
 export const AREAS_OF_LIFE = ["Building", "Research", "Content", "Ops", "Personal"] as const;
 
@@ -206,7 +280,20 @@ export interface TagPatch {
 /** Typed error the tag commands reject with — tauri rejects with the serialized
  *  object, so a catch block should be typed as this (branch on `kind`). */
 export interface TagError {
-  kind: "cli_not_found" | "timeout" | "cli_failed" | "bad_output" | "invalid_json" | "db";
+  kind:
+    | "cli_not_found"
+    | "timeout"
+    | "cli_failed"
+    | "bad_output"
+    | "invalid_json"
+    | "db"
+    | "no_recap"
+    | "no_api_key"
+    | "api_http"
+    | "rate_limited"
+    // Forward-compat: an unrecognized kind still carries a message and must
+    // degrade to rendering it, never a blank.
+    | (string & {});
   message: string;
 }
 
@@ -265,14 +352,35 @@ export const addBlacklistPattern = (pattern: string): Promise<BlacklistEntry[]> 
 export const removeBlacklistPattern = (pattern: string): Promise<BlacklistEntry[]> =>
   call<BlacklistEntry[]>("remove_blacklist_pattern", { pattern });
 
-// AI tagging (F3). tag_session shells out to the local claude CLI (may take a
-// second or two); update_session_tags is a synchronous hand-edit. Both reject
-// with a serialized TagError — catch with asTagError().
+export const previewBlacklistPattern = (pattern: string): Promise<BlacklistPreview> =>
+  call<BlacklistPreview>("preview_blacklist_pattern", { pattern });
+
+// Feature flag: AI tagging is PARKED. Manual keyboard triage (TriageMode) is the
+// primary path — zero latency, zero cost. Flip to true to resurface the Wand2
+// auto-tag actions and the backfill command; the code paths stay wired underneath.
+export const SHOW_AI_TAGGING = false;
+
+// AI tagging (F3). tag_session hits the direct Anthropic API when ANTHROPIC_API_KEY
+// is set (~1s), else falls back to the local claude CLI (~11s); update_session_tags
+// is a synchronous hand-edit. Both reject with a serialized TagError — catch with
+// asTagError().
 export const tagSession = (id: string): Promise<SessionTags> =>
   call<SessionTags>("tag_session", { id });
 
 export const updateSessionTags = (id: string, patch: TagPatch): Promise<SessionTags> =>
   call<SessionTags>("update_session_tags", { id, ...patch });
+
+// Bulk backfill (F3b). Tags every untagged session concurrently over the API path;
+// resumable. A no-op (skippedNoKey: true) with no API key. Subscribe to the
+// "backfill_progress" event ([done, total]) for a progress bar.
+export interface BackfillReport {
+  tagged: number;
+  failed: number;
+  skippedNoKey: boolean;
+}
+
+export const backfillTags = (): Promise<BackfillReport> =>
+  call<BackfillReport>("backfill_tags", {});
 
 // Kanban board (F4). The three columns; a drag sets an explicit status override
 // (null clears it, falling back to the %-derived column) plus a per-column order.
@@ -283,3 +391,60 @@ export const setKanban = (
   status: KanbanStatus | null,
   order: number | null,
 ): Promise<void> => call<void>("set_kanban", { id, status, order });
+
+// Timeline digest (P6). get_timeline is read-only and instant. digest_session
+// and digest_pending run the LLM behind the same TagError channel as tagging
+// (catch with asTagError()); "no_recap" is a truthful skip, not an error.
+export const getTimeline = (days = 7): Promise<TimelineResponse> =>
+  call<TimelineResponse>("get_timeline", { days });
+
+export const digestSession = (id: string): Promise<SessionDigest> =>
+  call<SessionDigest>("digest_session", { id });
+
+export const digestPending = (days = 7): Promise<DigestBatchReport> =>
+  call<DigestBatchReport>("digest_pending", { days });
+
+export const linkThreads = (days = 7): Promise<Thread[]> =>
+  call<Thread[]>("link_threads", { days });
+
+// Manual edit — each patched field becomes durable (returned in manualFields).
+export const updateSessionDigest = (id: string, patch: DigestPatch): Promise<SessionDigest> =>
+  call<SessionDigest>("update_session_digest", { id, ...patch });
+
+// ─── Home screen (first screen) ────────────────────────────────────────
+// list_threads clusters sessions into ranked threads (project / project·branch)
+// and returns the top `limit` plus the orientation counts. Computed at query
+// time; the frontend renders it verbatim — the why-sentence is pre-templated by
+// the backend, not assembled here.
+
+/** One ranked thread on the home screen. `whySentence` and `openTodos` are
+ *  already prepared by the backend; render verbatim. */
+export interface HomeThread {
+  key: string;
+  displayName: string;
+  areaOfLife: string | null;
+  gitBranch: string | null;
+  sessionCount: number;
+  activeDays14: number;
+  lastTs: string | null;
+  latestSessionId: string;
+  latestTitle: string;
+  latestRecap: string | null;
+  openTodos: string[]; // up to 3, already filtered to status != completed
+  completionPct: number | null;
+  whySentence: string; // pre-templated by backend, render verbatim
+  score: number;
+}
+
+/** Everything the home screen needs in one round-trip. `stale` flips the hero
+ *  from resume framing to memory-jog framing (global last activity > 14 days). */
+export interface HomeData {
+  threads: HomeThread[];
+  totalSessions: number;
+  activeThreadsThisWeek: number;
+  stale: boolean; // global last activity older than 14 days
+  lastActivityTs: string | null;
+}
+
+export const listThreads = (limit = 5): Promise<HomeData> =>
+  call<HomeData>("list_threads", { limit });

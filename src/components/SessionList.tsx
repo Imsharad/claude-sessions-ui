@@ -23,7 +23,7 @@ import {
   Loader2,
 } from "lucide-react";
 import type { SessionCard } from "../lib/ipc";
-import { tagSession, asTagError } from "../lib/ipc";
+import { tagSession, asTagError, SHOW_AI_TAGGING } from "../lib/ipc";
 import {
   relativeTime,
   formatTokens,
@@ -233,26 +233,26 @@ export function SessionCardView({
         >
           {headline}
         </p>
-        {/* Quick tag — hover-reveal like the expand chevron; stopPropagation so
-            it tags without selecting the row. Spinner uses the accent; on error
-            the icon turns danger with the message as its title, reverting on the
-            next hover. */}
-        <button
-          type="button"
-          title={tagFailed ?? "Tag session"}
-          onClick={handleQuickTag}
-          onMouseEnter={() => tagFailed && setTagFailed(null)}
-          disabled={tagging}
-          className={`mt-[1px] shrink-0 rounded p-0.5 transition group-hover:opacity-100 ${
-            tagFailed ? "text-danger opacity-100" : "text-ink-4 hover:text-accent"
-          } ${tagging ? "opacity-100" : "opacity-0"}`}
-        >
-          {tagging ? (
-            <Loader2 size={14} className="animate-spin text-accent" />
-          ) : (
-            <Wand2 size={14} />
-          )}
-        </button>
+        {/* Quick tag — PARKED (AI). Manual tagging is the Triage mode now; flip
+            SHOW_AI_TAGGING to resurface this hover-reveal auto-tag button. */}
+        {SHOW_AI_TAGGING && (
+          <button
+            type="button"
+            title={tagFailed ?? "Tag session"}
+            onClick={handleQuickTag}
+            onMouseEnter={() => tagFailed && setTagFailed(null)}
+            disabled={tagging}
+            className={`mt-[1px] shrink-0 rounded p-0.5 transition group-hover:opacity-100 ${
+              tagFailed ? "text-danger opacity-100" : "text-ink-4 hover:text-accent"
+            } ${tagging ? "opacity-100" : "opacity-0"}`}
+          >
+            {tagging ? (
+              <Loader2 size={14} className="animate-spin text-accent" />
+            ) : (
+              <Wand2 size={14} />
+            )}
+          </button>
+        )}
         {/* Expand affordance — quiet, appears on hover like the pin pattern.
             stopPropagation so it toggles the tier without selecting the row.
             Hidden on the board (Tier 2 expand-in-place lives in the list). */}

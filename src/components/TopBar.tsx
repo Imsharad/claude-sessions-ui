@@ -3,12 +3,12 @@
  * stats summary, and reindex action. Drag region for the window (Tauri native
  * feel — the bar moves the window on macOS).
  */
-import { RefreshCw, Loader2, Layers, BarChart3, BookOpen, List, LayoutGrid } from "lucide-react";
+import { RefreshCw, Loader2, Layers, BarChart3, BookOpen, List, LayoutGrid, Keyboard, Calendar, Home } from "lucide-react";
 import type { IndexStatus, GlobalStats } from "../lib/ipc";
 import { formatTokens, formatCost } from "../lib/format";
 
-export type View = "launcher" | "analytics" | "digest";
-export type LauncherMode = "list" | "board";
+export type View = "home" | "launcher" | "timeline" | "analytics" | "digest";
+export type LauncherMode = "list" | "board" | "triage";
 
 interface Props {
   view: View;
@@ -23,13 +23,16 @@ interface Props {
 
 export function TopBar({ view, onViewChange, launcherMode, onLauncherModeChange, status, stats, reindexing, onReindex }: Props) {
   const views: { id: View; label: string; icon: React.ReactNode }[] = [
+    { id: "home", label: "Home", icon: <Home size={12} /> },
     { id: "launcher", label: "Launcher", icon: <Layers size={12} /> },
+    { id: "timeline", label: "Timeline", icon: <Calendar size={12} /> },
     { id: "analytics", label: "Analytics", icon: <BarChart3 size={12} /> },
     { id: "digest", label: "Digest", icon: <BookOpen size={12} /> },
   ];
   const modes: { id: LauncherMode; label: string; icon: React.ReactNode }[] = [
     { id: "list", label: "List view", icon: <List size={12} /> },
     { id: "board", label: "Board view", icon: <LayoutGrid size={12} /> },
+    { id: "triage", label: "Triage (keyboard tagging)", icon: <Keyboard size={12} /> },
   ];
 
   return (

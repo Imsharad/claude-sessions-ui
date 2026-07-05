@@ -185,11 +185,15 @@ export interface Thread {
 }
 
 /** Everything the timeline needs in one round-trip: the day skeleton, the
- *  digests keyed by sessionId, and the linked threads. */
+ *  digests keyed by sessionId, and the linked threads. `metaSessionIds` carries
+ *  harness/self sessions (the triage + digest calls this feature spawns) —
+ *  excluded from days/totals, surfaced in a separate collapsed "app activity"
+ *  group. Empty when the window has none. */
 export interface TimelineResponse {
   days: TimelineDay[];
   digests: Record<string, SessionDigest>;
   threads: Thread[];
+  metaSessionIds: string[];
 }
 
 /** Result of a batch backfill over the window. */

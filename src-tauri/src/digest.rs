@@ -43,6 +43,21 @@ const RECAP_PROMPT_MAX: usize = 2000;
 /// Bounded concurrency for the batch pass (spec: 4).
 const DIGEST_WORKERS: usize = 4;
 
+/// Meta-session detection — the timeline watching itself work. A session is
+/// `meta_session` when ALL THREE signals hold (the AND is the honesty — any one
+/// alone is too noisy): a prompt-echo title prefix, a tiny message count, and
+/// the app's own project. Mirrors the two-source blacklist signal: a real row
+/// we deliberately exclude from the main list while still surfacing it honestly
+/// in a side channel (`meta_session_ids`).
+const META_MSG_THRESHOLD: i64 = 6;
+const APP_PROJECT: &str = "claude-sessions-ui";
+const META_TITLE_PREFIXES: &[&str] = &[
+    "You are writing",
+    "You are triaging",
+    "You are grouping",
+    "You are summarizing",
+];
+
 // ─── Wire types (camelCase; mirrored in src/lib/ipc.ts) ──────────────────────
 
 /// One session's digest row. `verified`/`confidence` drive quiet-vs-confident
@@ -92,6 +107,11 @@ pub struct TimelineResponse {
     pub days: Vec<TimelineDay>,
     pub digests: HashMap<String, SessionDigest>,
     pub threads: Vec<Thread>,
+    /// Harness/self sessions (triage, digest, grouping calls this very feature
+    /// spawns) excluded from `days` and every total. Surfaced here so the UI can
+    /// render them in a separate collapsed "app activity" group — never counted
+    /// in day summaries. Empty when the window has no such sessions.
+    pub meta_session_ids: Vec<String>,
 }
 
 /// Result of a batch backfill over the window.
@@ -715,6 +735,17 @@ fn dir_blacklisted(cwd: &str, project_dir: &str, patterns: &[String]) -> bool {
     })
 }
 
+/// True when a session is the timeline watching itself work — a harness call
+/// (triage/digest/group/summarize) this very feature spawns. Three
+/// jointly-required signals (the AND is the honesty): prompt-echo title prefix,
+/// tiny message count, and the app's own project. `project_tail` is the cwd's
+/// last path segment, matching how `display_project` is derived everywhere else.
+fn is_meta_session(title: &str, message_count: i64, project_tail: &str) -> bool {
+    message_count < META_MSG_THRESHOLD
+        && project_tail == APP_PROJECT
+        && META_TITLE_PREFIXES.iter().any(|p| title.starts_with(p))
+}
+
 /// Session ids in the window, blacklist-filtered. Backs the batch + linking
 /// passes (the timeline command builds its own richer projection).
 fn window_session_ids(conn: &Connection, days: u32) -> Result<Vec<String>, TagError> {
@@ -807,19 +838,20 @@ pub fn build_timeline(conn: &Connection, days: u32) -> Result<TimelineResponse, 
     let (today, oldest) = window_bounds(days);
     let patterns = crate::db::load_blacklist_patterns(conn);
 
-    // Sessions in the window, with their local-date bucket. Newest first so the
-    // per-day session lists read newest-session-first.
+    // Sessions in the window, with their local-date bucket. Sorted by LAST
+    // activity (not session start) so the per-day lists read in the same order
+    // as the relative-time display (`card.lastTs`) — no broken-random chronology.
     let mut stmt = conn
         .prepare(
-            "SELECT id, cwd, project_dir, date(first_ts,'localtime') AS d
+            "SELECT id, cwd, project_dir, title, message_count, date(first_ts,'localtime') AS d
              FROM sessions
              WHERE date(first_ts,'localtime') >= ?1
-             ORDER BY first_ts DESC",
+             ORDER BY last_ts DESC",
         )
         .map_err(db_err)?;
-    let rows: Vec<(String, String, String, String)> = stmt
+    let rows: Vec<(String, String, String, String, i64, String)> = stmt
         .query_map(params![oldest], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
         })
         .map_err(db_err)?
         .filter_map(Result::ok)
@@ -828,8 +860,17 @@ pub fn build_timeline(conn: &Connection, days: u32) -> Result<TimelineResponse, 
 
     let mut by_date: HashMap<String, Vec<String>> = HashMap::new();
     let mut window_ids: HashSet<String> = HashSet::new();
-    for (id, cwd, pd, d) in rows {
+    let mut meta_ids: Vec<String> = Vec::new();
+    for (id, cwd, pd, title, msg, d) in rows {
         if dir_blacklisted(&cwd, &pd, &patterns) {
+            continue;
+        }
+        // Meta-sessions (the timeline watching itself work) are routed to a
+        // side channel — excluded from days/totals/digests/threads, surfaced
+        // only in `meta_session_ids`. Same shape as the blacklist `continue`.
+        let tail = cwd.split('/').next_back().unwrap_or(&cwd);
+        if is_meta_session(&title, msg, tail) {
+            meta_ids.push(id);
             continue;
         }
         by_date.entry(d).or_default().push(id.clone());
@@ -857,6 +898,7 @@ pub fn build_timeline(conn: &Connection, days: u32) -> Result<TimelineResponse, 
         days: days_vec,
         digests,
         threads,
+        meta_session_ids: meta_ids,
     })
 }
 

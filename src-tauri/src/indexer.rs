@@ -14,7 +14,7 @@ use crate::db::set_meta;
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -72,6 +72,22 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
     // Load config once: gives us per-project cost/lines data for the projects table.
     let config = load_claude_json();
 
+    // Blacklisted project trees never enter the DB as tracked. Rows already
+    // indexed are left alone — un-blacklisting re-surfaces them without a wipe
+    // (the query paths in lib.rs are the second enforcement point).
+    let blacklist = crate::db::load_blacklist_patterns(conn);
+
+    // Per-pattern skip tally (source (b) of the honest blacklist count): session
+    // files skipped at scan time, which never enter `sessions`. Seed every pattern
+    // to 0 so a pattern whose files vanished from disk gets its stale count cleared
+    // this pass (overwrite semantics, not increment). Kept DISJOINT from the
+    // table-match count (lib::count_matches): a file already indexed (in `sessions`)
+    // is NOT tallied here — otherwise a pattern added after indexing would be
+    // double-counted (its rows linger in `sessions` yet also skip at scan time).
+    let indexed_paths: HashSet<String> = load_indexed_paths(conn);
+    let mut skip_tally: HashMap<String, i64> =
+        blacklist.iter().map(|p| (p.clone(), 0i64)).collect();
+
     let mut files_seen = 0usize;
     let mut files_reindexed = 0usize;
     let mut files_skipped = 0usize;
@@ -99,6 +115,27 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
     {
         files_seen += 1;
         let path = entry.path();
+        let path_str = path.to_string_lossy().to_string();
+        let encoded_dir = path
+            .parent()
+            .and_then(|p| p.file_name().and_then(|s| s.to_str()))
+            .unwrap_or("");
+        let mut blacklisted = false;
+        for p in &blacklist {
+            if is_blacklisted_encoded(encoded_dir, p) {
+                blacklisted = true;
+                // Tally only files that are NOT already indexed sessions — keeps
+                // source (b) disjoint from source (a) so no double count.
+                if !indexed_paths.contains(&path_str) {
+                    if let Some(c) = skip_tally.get_mut(p) {
+                        *c += 1;
+                    }
+                }
+            }
+        }
+        if blacklisted {
+            continue;
+        }
         let mtime = match file_mtime_secs(path) {
             Ok(m) => m,
             Err(e) => {
@@ -106,7 +143,6 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
                 continue;
             }
         };
-        let path_str = path.to_string_lossy().to_string();
         if !force_full {
             if let Some(&known) = known_mtimes.get(&path_str) {
                 if known == mtime {
@@ -130,6 +166,16 @@ pub fn run(conn: &Connection, force_full: bool) -> ScanStats {
                 last_err = Some(format!("parse {}: {}", path.display(), e));
             }
         }
+    }
+
+    // Persist the per-pattern skip tally (overwrite, not increment) so the honest
+    // blacklist count reflects the current on-disk reality after this pass.
+    for (pattern, count) in &skip_tally {
+        conn.execute(
+            "UPDATE project_blacklist SET skipped_count = ?1 WHERE pattern = ?2",
+            params![count, pattern],
+        )
+        .ok();
     }
 
     // Rebuild the projects table from the now-current sessions.
@@ -162,6 +208,17 @@ fn file_mtime_secs(p: &Path) -> std::io::Result<i64> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0))
+}
+
+/// All file paths currently in `sessions` — the "indexed" set, used to keep the
+/// blacklist skip tally disjoint from the table-match count.
+fn load_indexed_paths(conn: &Connection) -> HashSet<String> {
+    conn.prepare("SELECT file_path FROM sessions")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
 }
 
 fn load_known_mtimes(conn: &Connection) -> HashMap<String, i64> {
@@ -208,6 +265,37 @@ fn load_claude_json() -> ClaudeConfig {
         )
     }).collect();
     ClaudeConfig { projects }
+}
+
+// ─── Blacklist matching ─────────────────────────────────────────────────────
+// A pattern names a directory (relative like "udacity-project-reviews" or
+// absolute), with an optional "/**" suffix; either way it matches that dir AND
+// all descendants. Matching is segment-bounded so "brain" never hits "brainstorm".
+//
+// Two spaces to match in: real cwd paths use '/' separators; the encoded
+// project dir name uses '-' (Claude Code encodes cwd by replacing '/' with '-',
+// so a hyphenated project name is only unambiguous in encoded space).
+
+/// Does a real cwd path (e.g. "/Users/x/Projects/foo") fall under `pattern`?
+pub fn is_blacklisted(cwd: &str, pattern: &str) -> bool {
+    let base = pattern.trim_end_matches("/**").trim_end_matches('/');
+    !base.is_empty() && segment_match(cwd, base, '/')
+}
+
+/// Does an encoded project dir (e.g. "-Users-x-Projects-foo-bar") fall under
+/// `pattern`? Pattern separators are translated to encoded space first.
+pub fn is_blacklisted_encoded(encoded_dir: &str, pattern: &str) -> bool {
+    let base = pattern.trim_end_matches("/**").trim_end_matches('/').replace('/', "-");
+    !base.is_empty() && segment_match(encoded_dir, &base, '-')
+}
+
+/// True when `base` appears in `hay` bounded by `sep` (or string edges) —
+/// i.e. `hay` IS base, starts with base/, ends with /base, or contains /base/.
+fn segment_match(hay: &str, base: &str, sep: char) -> bool {
+    hay == base
+        || hay.starts_with(&format!("{base}{sep}"))
+        || hay.ends_with(&format!("{sep}{base}"))
+        || hay.contains(&format!("{sep}{base}{sep}"))
 }
 
 /// The encoded dir name (e.g. "-Users-sharad-...") → decoded cwd path.
@@ -692,35 +780,50 @@ fn truncate_str(s: &str, max: usize) -> String {
 }
 
 /// Clean a candidate title so prompt-content garbage doesn't leak as the
-/// display title. Mirrors the frontend sanitizeTitle logic so both stay
-/// consistent. Returns None if nothing usable remains.
+/// display title. Rust-only — there is no frontend counterpart; the stored
+/// title is authoritative. Returns None if nothing usable remains.
 ///
-///   "<instructions><references>"  →  "instructions references"
-///   "## Task: do X"               →  "Task: do X"
+/// Preserves *interior* underscores / asterisks / backticks so real identifiers
+/// survive intact ("TAG_AND_TRIAGE_PROMPT.md", "snake_case_name"). Only a
+/// *wrapping* emphasis pair is peeled ("_wrapped_" -> "wrapped",
+/// "**bold**" -> "bold"). Also strips leading prompt scaffolding (list markers,
+/// blockquotes, headers) and XML/HTML tags.
+///
+///   "<instructions>Hello</instructions>"  →  "Hello"
+///   "## Task: do X"                       →  "Task: do X"
+///   "- Use the files: -"                  →  "Use the files: -"
 fn sanitize_title(raw: &str) -> Option<String> {
     let mut s = raw.trim().to_string();
     if s.is_empty() {
         return None;
     }
-    // Strip XML/HTML tags, keep inner text.
-    while let (Some(start), _) = (s.find('<'), s.find('>')) {
-        if let Some(end) = s.find('>') {
-            if end > start {
+    // Strip XML/HTML tags (including their attributes), keeping inner text.
+    // Scan for '<' then the next '>' AFTER it, so a stray '>' before the first
+    // '<' can't confuse the range.
+    while let Some(start) = s.find('<') {
+        match s[start + 1..].find('>') {
+            Some(rel) => {
+                let end = start + 1 + rel;
                 s.replace_range(start..=end, " ");
-            } else {
-                break;
             }
-        } else {
-            break;
+            None => break,
         }
     }
-    // Strip markdown headers / emphasis.
-    let stripped = s.trim_start_matches('#').trim_start();
-    let stripped = stripped.replace(['*', '_', '`'], "");
-    s = stripped;
-    // Collapse whitespace.
+    // Collapse whitespace runs to single spaces up front so marker / emphasis
+    // checks see clean tokens.
     s = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Drop leading @ / / file-ref noise.
+    // Peel leading prompt scaffolding — markdown headers, list markers,
+    // blockquotes — possibly stacked (e.g. "> - text").
+    loop {
+        let peeled = peel_leading_marker(&s);
+        if peeled.len() == s.len() {
+            break;
+        }
+        s = peeled.trim_start().to_string();
+    }
+    // Peel a *wrapping* emphasis pair only — interior _ * ` are preserved.
+    s = strip_wrapping_emphasis(&s);
+    // Drop leading @ / \ file-ref noise (interior slashes stay: "src/foo.rs").
     s = s.trim_start_matches(|c: char| c == '@' || c == '/' || c == '\\').to_string();
     let s = s.trim().to_string();
     if s.is_empty() {
@@ -728,6 +831,57 @@ fn sanitize_title(raw: &str) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Peel a single leading scaffolding marker (header hash, ordered/unordered
+/// list bullet, blockquote). Returns the remainder, or the trimmed input
+/// unchanged when no marker leads. Callers loop until it stabilises.
+fn peel_leading_marker(s: &str) -> &str {
+    let t = s.trim_start();
+    // Markdown header hash(es): peel one '#' per call, loop handles "##".
+    if let Some(rest) = t.strip_prefix('#') {
+        return rest;
+    }
+    // Ordered list: leading ASCII digits followed by ". ".
+    let dlen = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    if dlen > 0 {
+        if let Some(rest) = t[dlen..].strip_prefix(". ") {
+            return rest;
+        }
+    }
+    // Unordered bullets / blockquote (require the trailing space so we never
+    // eat a real "*emphasis*" or "-hyphenated" token).
+    for m in ["- ", "* ", "+ ", "> "] {
+        if let Some(rest) = t.strip_prefix(m) {
+            return rest;
+        }
+    }
+    t
+}
+
+/// Strip a *wrapping* emphasis pair ("_x_", "*x*", "**x**", "`x`") — but only
+/// when the marker does not recur inside, so structural markers survive
+/// ("snake_case_name" is untouched because it does not start/end with '_';
+/// "a_b_c" wrapped in '_' would keep its interior separators).
+fn strip_wrapping_emphasis(s: &str) -> String {
+    let mut s = s.trim();
+    loop {
+        let mut changed = false;
+        for marker in ["**", "__", "*", "_", "`"] {
+            if s.len() > 2 * marker.len() && s.starts_with(marker) && s.ends_with(marker) {
+                let inner = s[marker.len()..s.len() - marker.len()].trim();
+                if !inner.is_empty() && !inner.contains(marker) {
+                    s = inner;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    s.to_string()
 }
 
 /// Difference between two ISO timestamps in milliseconds (best-effort).
@@ -856,6 +1010,33 @@ mod tests {
     }
 
     #[test]
+    fn blacklist_matches_parent_and_descendants() {
+        let p = "udacity-project-reviews/**";
+        assert!(is_blacklisted("/Users/s/Projects/udacity-project-reviews", p));
+        assert!(is_blacklisted("/Users/s/Projects/udacity-project-reviews/sub/dir", p));
+        assert!(!is_blacklisted("/Users/s/Projects/udacity-project-reviews-fork", p));
+        assert!(!is_blacklisted("/Users/s/Projects/other", p));
+        // plain pattern (no /**) has the same dir-and-descendants semantics
+        assert!(is_blacklisted("/Users/s/Projects/brain/sub", "brain"));
+        assert!(!is_blacklisted("/Users/s/Projects/brainstorm", "brain"));
+        // absolute pattern
+        assert!(is_blacklisted("/Users/s/Projects/brain", "/Users/s/Projects/brain/**"));
+        assert!(!is_blacklisted("/Users/s/Projects", "/Users/s/Projects/brain/**"));
+    }
+
+    #[test]
+    fn blacklist_matches_encoded_dirs() {
+        let p = "udacity-project-reviews/**";
+        assert!(is_blacklisted_encoded("-Users-s-Projects-udacity-project-reviews", p));
+        assert!(is_blacklisted_encoded("-Users-s-Projects-udacity-project-reviews-sub", p));
+        // NOT a false positive on a sibling that merely shares the prefix chars
+        assert!(!is_blacklisted_encoded("-Users-s-Projects-udacity-project-reviewsx", p));
+        // pattern with a path gets its '/' translated to encoded '-'
+        assert!(is_blacklisted_encoded("-Users-s-NOW-brain", "NOW/brain/**"));
+        assert!(!is_blacklisted_encoded("-Users-s-THEN-brain", "NOW/brain/**"));
+    }
+
+    #[test]
     fn decode_dir() {
         assert_eq!(decode_project_dir("-home-test"), "/home/test");
         assert_eq!(decode_project_dir("a-b-c"), "a/b/c");
@@ -868,6 +1049,18 @@ mod tests {
         assert_eq!(sanitize_title("@/src/foo.rs").unwrap(), "src/foo.rs");
         assert_eq!(sanitize_title("    _test_  ").unwrap(), "test");
         assert!(sanitize_title("<tag></tag>").is_none());
+        // Interior underscores/identifiers are preserved (no blanket stripping).
+        assert_eq!(sanitize_title("TAG_AND_TRIAGE_PROMPT.md").unwrap(), "TAG_AND_TRIAGE_PROMPT.md");
+        assert_eq!(sanitize_title("snake_case_name").unwrap(), "snake_case_name");
+        // Only a genuine wrapping emphasis pair is peeled.
+        assert_eq!(sanitize_title("_wrapped_").unwrap(), "wrapped");
+        assert_eq!(sanitize_title("**bold**").unwrap(), "bold");
+        // XML tags with attributes are stripped, inner text kept.
+        assert_eq!(sanitize_title(r#"<tool name="x">run tests</tool>"#).unwrap(), "run tests");
+        // Leading list / blockquote scaffolding is peeled; trailing debris stays.
+        assert_eq!(sanitize_title("- Use the following files as reference: -").unwrap(), "Use the following files as reference: -");
+        assert_eq!(sanitize_title("> - quoted bullet").unwrap(), "quoted bullet");
+        assert_eq!(sanitize_title("1. first step").unwrap(), "first step");
     }
 
     #[test]

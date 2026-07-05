@@ -12,13 +12,21 @@
 //!   toggle_pin(encoded_dir)
 //!   index_status() -> IndexStatus
 
+pub mod anthropic;
 pub mod claude;
 pub mod db;
+pub mod digest;
+pub mod home;
 pub mod indexer;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tauri::Emitter;
 use std::collections::HashMap;
+
+use digest::{DigestBatchReport, SessionDigest, Thread, TimelineResponse};
 
 // ─── IPC types ──────────────────────────────────────────────────────────────
 
@@ -70,6 +78,31 @@ pub struct SessionCard {
     pub cost_usd: f64,
     pub cost_source: String, // 'config' | 'estimate' | 'mixed' | 'none'
     pub pinned: bool,
+    // ─── Tag & triage (F3 populates, F2 renders, F4 places) ───
+    // All nullable: absent = untagged, which the UI renders as clean absence.
+    pub area_of_life: Option<String>,
+    pub project_short_name: Option<String>,
+    pub goal_completed: Option<bool>,
+    pub completion_pct: Option<i64>,
+    pub tag_rationale: Option<String>,
+    pub tagged_at: Option<String>,
+    /// Hand-edited field names, parsed from the `manual_fields` JSON array
+    /// string. Null/invalid degrades to empty — no hand-edits, cleanly.
+    pub manual_fields: Vec<String>,
+    pub kanban_status: Option<String>,
+    pub kanban_order: Option<f64>,
+    /// The session's stated next step, derived at read time from the final recap's
+    /// text (see `extract_next_action`). Only `get_session_detail` populates it; the
+    /// list query leaves it None. None when no next-step marker is found.
+    pub next_action: Option<String>,
+}
+
+/// Parse the `manual_fields` column (a JSON array string of field names) into a
+/// Vec. Null, empty, or invalid JSON all degrade to an empty vec.
+fn parse_manual_fields(raw: Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -195,6 +228,48 @@ pub struct PricingRow {
     pub cache_read_per_mtok: f64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BlacklistEntry {
+    pub pattern: String,
+    pub created_at: Option<String>,
+    /// Honest live count of sessions this pattern hides: indexed-but-filtered
+    /// rows plus files skipped at scan time (which never entered `sessions`).
+    pub match_count: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BlacklistPreview {
+    /// Distinct projects a candidate pattern would hide (indexed sessions only).
+    pub project_count: i64,
+    /// Indexed sessions a candidate pattern would hide.
+    pub session_count: i64,
+}
+
+use claude::TagError;
+
+/// Controlled area-of-life vocabulary (the editable one-liner from the spec).
+/// Server-side validation normalizes the model's output against this list.
+const AREAS_OF_LIFE: [&str; 5] = ["Building", "Research", "Content", "Ops", "Personal"];
+
+/// The tagging model — fast + cheap, present in the pricing table.
+const TAGGING_MODEL: &str = "claude-haiku-4-5";
+
+/// The tag fields returned to the frontend after a tag / edit. camelCase over
+/// the wire, mirrored by `SessionTags` in ipc.ts.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTags {
+    pub area_of_life: Option<String>,
+    pub project_short_name: Option<String>,
+    pub goal_completed: Option<bool>,
+    pub completion_pct: Option<i64>,
+    pub tag_rationale: Option<String>,
+    pub tagged_at: Option<String>,
+    pub manual_fields: Vec<String>,
+}
+
 // ─── Commands ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -233,7 +308,9 @@ fn list_sessions(filter: Option<SessionFilter>) -> Result<Vec<SessionCard>, Stri
                 COALESCE(SUM(u.input_toks),0), COALESCE(SUM(u.output_toks),0),
                 COALESCE(SUM(u.cache_read_toks),0),
                 COALESCE(SUM(u.cost_usd),0),
-                p.pinned
+                p.pinned,
+                s.area_of_life, s.project_short_name, s.goal_completed, s.completion_pct,
+                s.tag_rationale, s.tagged_at, s.manual_fields, s.kanban_status, s.kanban_order
          FROM sessions s
          LEFT JOIN session_usage u ON u.session_id = s.id
          LEFT JOIN projects p ON p.encoded_dir = s.project_dir",
@@ -271,12 +348,16 @@ fn list_sessions(filter: Option<SessionFilter>) -> Result<Vec<SessionCard>, Stri
 
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     // ponytail: iter over dynamic params, functional collect
-    let out: Result<Vec<SessionCard>, String> = stmt
+    let mut out: Vec<SessionCard> = stmt
         .query_map(rusqlite::params_from_iter(binds), map_session_card)
         .map_err(|e| e.to_string())?
         .map(|r| r.map_err(|e| e.to_string()))
-        .collect();
-    out
+        .collect::<Result<_, _>>()?;
+    // Defensive filter: drop blacklisted trees still lingering in the DB so a
+    // just-added pattern takes effect this query cycle, no re-index needed.
+    let patterns = db::load_blacklist_patterns(&conn);
+    out.retain(|c| !dir_blacklisted(&c.cwd, &c.project_dir, &patterns));
+    Ok(out)
 }
 
 fn map_session_card(r: &rusqlite::Row) -> rusqlite::Result<SessionCard> {
@@ -302,6 +383,18 @@ fn map_session_card(r: &rusqlite::Row) -> rusqlite::Result<SessionCard> {
         cost_usd: r.get(15)?,
         cost_source: "aggregated".to_string(), // simplified; detail view has per-row source
         pinned: r.get::<_, i64>(16)? != 0,
+        area_of_life: r.get(17)?,
+        project_short_name: r.get(18)?,
+        goal_completed: r.get::<_, Option<i64>>(19)?.map(|v| v != 0),
+        completion_pct: r.get(20)?,
+        tag_rationale: r.get(21)?,
+        tagged_at: r.get(22)?,
+        manual_fields: parse_manual_fields(r.get(23)?),
+        kanban_status: r.get(24)?,
+        kanban_order: r.get(25)?,
+        // Derived at read time, and only in the detail command (which has the
+        // recaps in hand). The list query leaves it None.
+        next_action: None,
     })
 }
 
@@ -309,12 +402,218 @@ fn project_display(cwd: &str) -> String {
     cwd.split('/').next_back().unwrap_or(cwd).to_string()
 }
 
+// ─── Blacklist: defensive query-path filter + live match counts ──────────────
+// The indexer skips blacklisted trees at scan time; these apply the *second*
+// enforcement point so a pattern added after indexing (or one whose rows still
+// linger) drops those sessions from every query, and un-blacklisting re-surfaces
+// them without a wipe. Both checks run — real cwd path AND encoded project_dir —
+// because a hyphenated project name is only unambiguous in encoded space.
+
+/// True when a session's `cwd` or encoded `project_dir` matches ANY pattern.
+/// The one predicate the three query paths filter on, so each stays a one-liner.
+fn dir_blacklisted(cwd: &str, project_dir: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|p| indexer::is_blacklisted(cwd, p) || indexer::is_blacklisted_encoded(project_dir, p))
+}
+
+/// Sessions a SINGLE pattern currently hides — computed in Rust over the
+/// (cwd, project_dir) pairs, not a SQL glob, so it matches the indexer exactly.
+fn count_matches(pairs: &[(String, String)], pattern: &str) -> i64 {
+    pairs
+        .iter()
+        .filter(|(cwd, pd)| {
+            indexer::is_blacklisted(cwd, pattern) || indexer::is_blacklisted_encoded(pd, pattern)
+        })
+        .count() as i64
+}
+
+/// All (cwd, project_dir) pairs — cheap for a ~700-row dataset. Backs both the
+/// match counts and the defensive filter.
+fn load_session_dirs(conn: &rusqlite::Connection) -> Vec<(String, String)> {
+    conn.prepare("SELECT cwd, project_dir FROM sessions")
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Build the blacklist list with a live match count per pattern. Shared by the
+/// list command and the two mutators (which return the refreshed list).
+fn blacklist_entries(conn: &rusqlite::Connection) -> Result<Vec<BlacklistEntry>, String> {
+    let pairs = load_session_dirs(conn);
+    let mut stmt = conn
+        .prepare(
+            "SELECT pattern, created_at, COALESCE(skipped_count, 0)
+             FROM project_blacklist ORDER BY created_at",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, Option<String>, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows
+        .into_iter()
+        .map(|(pattern, created_at, skipped_count)| {
+            // Honest two-source sum: indexed-but-filtered rows (source a) +
+            // files skipped at scan time that never entered `sessions` (source
+            // b, persisted by the indexer). Disjoint by construction, so adding
+            // is safe — no session is in both sets.
+            let match_count = count_matches(&pairs, &pattern) + skipped_count;
+            BlacklistEntry {
+                pattern,
+                created_at,
+                match_count,
+            }
+        })
+        .collect())
+}
+
+/// What a candidate pattern WOULD hide, over indexed sessions only. Sessions
+/// already skipped at scan time by another pattern are invisible here — fine,
+/// they are hidden either way, and a candidate is judged on what it changes.
+fn preview_counts(pairs: &[(String, String)], pattern: &str) -> (i64, i64) {
+    let mut projects = std::collections::HashSet::new();
+    let mut sessions = 0i64;
+    for (cwd, pd) in pairs {
+        if indexer::is_blacklisted(cwd, pattern) || indexer::is_blacklisted_encoded(pd, pattern) {
+            sessions += 1;
+            projects.insert(pd.as_str());
+        }
+    }
+    (projects.len() as i64, sessions)
+}
+
+#[tauri::command]
+fn preview_blacklist_pattern(pattern: String) -> Result<BlacklistPreview, String> {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return Ok(BlacklistPreview { project_count: 0, session_count: 0 });
+    }
+    let conn = db::open().map_err(|e| e.to_string())?;
+    let (project_count, session_count) = preview_counts(&load_session_dirs(&conn), p);
+    Ok(BlacklistPreview { project_count, session_count })
+}
+
+#[tauri::command]
+fn list_blacklist() -> Result<Vec<BlacklistEntry>, String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    blacklist_entries(&conn)
+}
+
+#[tauri::command]
+fn add_blacklist_pattern(pattern: String) -> Result<Vec<BlacklistEntry>, String> {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return Err("Enter a pattern to hide a project.".to_string());
+    }
+    let conn = db::open().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT OR IGNORE INTO project_blacklist (pattern, created_at) VALUES (?1, ?2)",
+        params![p, chrono::Utc::now().to_rfc3339()],
+    )
+    .map_err(|e| e.to_string())?;
+    blacklist_entries(&conn)
+}
+
+#[tauri::command]
+fn remove_blacklist_pattern(pattern: String) -> Result<Vec<BlacklistEntry>, String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM project_blacklist WHERE pattern = ?1",
+        params![pattern.trim()],
+    )
+    .map_err(|e| e.to_string())?;
+    blacklist_entries(&conn)
+}
+
+// ─── Home screen: threads ────────────────────────────────────────────────────
+// Clusters the indexed (non-blacklisted) sessions into work threads, scores them
+// (recency × density × unfinished × pinned, gated by a substance guard), and
+// returns the top `limit` with a templated why-sentence. All ranking logic lives
+// in home.rs (pure + unit-tested); this wrapper just loads rows, ranks, and fills
+// the winners' open-todo contents.
+
+#[tauri::command]
+fn list_threads(limit: Option<usize>) -> Result<home::HomeData, String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    let rows = home::load_session_rows(&conn)?;
+    let mut data = home::build_home(rows, chrono::Utc::now(), limit.unwrap_or(5));
+    // Second query: open-todo contents for the winning threads' latest sessions.
+    for t in &mut data.threads {
+        t.open_todos = home::load_open_todos(&conn, &t.latest_session_id);
+    }
+    Ok(data)
+}
+
+// ─── Next-action extraction ──────────────────────────────────────────────────
+// Derived, not stored: the detail command reads the final recap's text and pulls
+// the first stated next step out of it. No DB column, no migration — recompute on
+// each read, which is cheap against a single already-loaded recap.
+
+/// Markers that introduce a stated next step, matched case-insensitively. Kept as
+/// literals (no regex dependency); the barest "next:" is last only for readability
+/// — selection is by earliest position in the text, not list order.
+const NEXT_ACTION_MARKERS: [&str; 6] = [
+    "next action is",
+    "next action:",
+    "next steps:",
+    "next up:",
+    "todo next",
+    "next:",
+];
+
+/// Cap on the returned string so a marker followed by a wall of text can't bloat
+/// the payload. ~200 chars per the spec.
+const NEXT_ACTION_MAX_CHARS: usize = 200;
+
+/// Pick the recap to derive the next action from — the one marked final, else the
+/// most recent (recaps arrive ordered by seq ascending, so `last`). None when the
+/// chosen recap has no next-step marker.
+fn next_action_from_recaps(recaps: &[Recap]) -> Option<String> {
+    let chosen = recaps.iter().find(|r| r.is_final).or_else(|| recaps.last())?;
+    extract_next_action(&chosen.content)
+}
+
+/// Extract a session's stated next step from a recap's text. Finds the first
+/// occurrence of any next-step marker and returns the remainder of that line after
+/// it, whitespace-normalized and capped. None when no marker is present, or when
+/// only whitespace follows it — never an empty string.
+fn extract_next_action(content: &str) -> Option<String> {
+    // ASCII-lowercase keeps byte length (and char boundaries) identical to the
+    // original, so a match index found here slices `content` safely. The markers
+    // are all ASCII, so ASCII folding is enough to match case-insensitively.
+    let lower = content.to_ascii_lowercase();
+    // Earliest marker wins; on a tie at the same index the longer marker wins, so
+    // "next action:" beats a bare "next:" that would start at the same place.
+    let (idx, marker_len) = NEXT_ACTION_MARKERS
+        .iter()
+        .filter_map(|m| lower.find(m).map(|i| (i, m.len())))
+        .min_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))?;
+
+    // Remainder of the line after the marker (a next step is a single line here).
+    let after = &content[idx + marker_len..];
+    let line = after.split(['\n', '\r']).next().unwrap_or(after);
+    // Whitespace-normalize (collapse runs, drop leading/trailing), then cap.
+    let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let capped: String = normalized.chars().take(NEXT_ACTION_MAX_CHARS).collect();
+    let trimmed = capped.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[tauri::command]
 fn get_session_detail(id: String) -> Result<SessionDetail, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
 
-    // Card row — direct lookup instead of loading every session.
-    let card: SessionCard = {
+    // Card row — direct lookup instead of loading every session. Mutable so the
+    // derived next_action can be filled in once the recaps are loaded below.
+    let mut card: SessionCard = {
         let mut stmt = conn
             .prepare(
                 "SELECT s.id, s.project_dir, s.cwd, s.git_branch, s.title, s.first_ts, s.last_ts,
@@ -324,7 +623,9 @@ fn get_session_detail(id: String) -> Result<SessionDetail, String> {
                         COALESCE((SELECT SUM(output_toks) FROM session_usage u WHERE u.session_id=s.id),0),
                         COALESCE((SELECT SUM(cache_read_toks) FROM session_usage u WHERE u.session_id=s.id),0),
                         COALESCE((SELECT SUM(cost_usd) FROM session_usage u WHERE u.session_id=s.id),0),
-                        COALESCE((SELECT pinned FROM projects p WHERE p.encoded_dir=s.project_dir),0)
+                        COALESCE((SELECT pinned FROM projects p WHERE p.encoded_dir=s.project_dir),0),
+                        s.area_of_life, s.project_short_name, s.goal_completed, s.completion_pct,
+                        s.tag_rationale, s.tagged_at, s.manual_fields, s.kanban_status, s.kanban_order
                  FROM sessions s WHERE s.id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -350,6 +651,9 @@ fn get_session_detail(id: String) -> Result<SessionDetail, String> {
         .filter_map(|r| r.ok())
         .collect();
     drop(stmt);
+
+    // Derived next step: read from the final recap (else the most recent one).
+    card.next_action = next_action_from_recaps(&recaps);
 
     // Todos
     let mut stmt = conn
@@ -452,7 +756,7 @@ fn search_recaps(query: String) -> Result<Vec<RecapHit>, String> {
     // a map so the ranker sees the whole recap, not a per-term fragment.
     let mut stmt = conn
         .prepare(
-            "SELECT r.session_id, r.uuid, s.title, s.cwd, r.captured_ts, r.content
+            "SELECT r.session_id, r.uuid, s.title, s.cwd, r.captured_ts, r.content, s.project_dir
              FROM recaps r
              JOIN sessions s ON s.id = r.session_id
              WHERE r.content LIKE ?1",
@@ -472,6 +776,7 @@ fn search_recaps(query: String) -> Result<Vec<RecapHit>, String> {
                     cwd: r.get(3)?,
                     captured_ts: r.get::<_, Option<String>>(4)?,
                     content: r.get(5)?,
+                    project_dir: r.get(6)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -489,10 +794,13 @@ fn search_recaps(query: String) -> Result<Vec<RecapHit>, String> {
     }
     drop(stmt);
 
-    // Score + extract snippet, then rank.
+    // Score + extract snippet, then rank. Defensive blacklist filter first, so
+    // hidden trees never appear in search even if their rows still exist.
+    let patterns = db::load_blacklist_patterns(&conn);
     let now = chrono::Utc::now();
     let mut scored: Vec<RecapHit> = seen
         .into_values()
+        .filter(|c| !dir_blacklisted(&c.cwd, &c.project_dir, &patterns))
         .map(|c| score_recap(c, &terms, now))
         .collect();
     // Primary: score desc. Tiebreak: most recent first.
@@ -525,6 +833,8 @@ struct CandidateRecap {
     cwd: String,
     captured_ts: Option<String>,
     content: String,
+    /// Encoded project dir, read only for the defensive blacklist filter.
+    project_dir: String,
 }
 
 /// Score a recap against the query terms and extract the best snippet window.
@@ -755,7 +1065,7 @@ fn digest(days: Option<i64>) -> Result<Vec<DigestDay>, String> {
         .prepare(&format!(
             "SELECT s.id, s.title, s.cwd, s.last_ts,
                     (SELECT content FROM recaps r WHERE r.session_id = s.id AND r.is_final = 1),
-                    s.message_count
+                    s.message_count, s.project_dir
              FROM sessions s
              WHERE s.last_ts >= datetime('now', '-{} days')
              ORDER BY s.last_ts DESC",
@@ -765,6 +1075,7 @@ fn digest(days: Option<i64>) -> Result<Vec<DigestDay>, String> {
     let rows = stmt
         .query_map([], |r| {
             let cwd: String = r.get(2)?;
+            let project_dir: String = r.get(6)?;
             let last_ts: Option<String> = r.get(3)?;
             let day = last_ts
                 .as_deref()
@@ -780,18 +1091,23 @@ fn digest(days: Option<i64>) -> Result<Vec<DigestDay>, String> {
                 recap: r.get(4)?,
                 message_count: r.get(5)?,
             })
-            .map(|e| (day, e))
+            .map(|e| (day, project_dir, e))
         })
         .map_err(|e| e.to_string())?;
 
+    // Defensive filter: same dual check as the indexer / list_sessions.
+    let patterns = db::load_blacklist_patterns(&conn);
     let mut by_day: Vec<DigestDay> = Vec::new();
-    for r in rows.flatten() {
-        if by_day.last().map(|d| d.day == r.0).unwrap_or(false) {
-            by_day.last_mut().unwrap().sessions.push(r.1);
+    for (day, project_dir, entry) in rows.flatten() {
+        if dir_blacklisted(&entry.cwd, &project_dir, &patterns) {
+            continue;
+        }
+        if by_day.last().map(|d| d.day == day).unwrap_or(false) {
+            by_day.last_mut().unwrap().sessions.push(entry);
         } else {
             by_day.push(DigestDay {
-                day: r.0,
-                sessions: vec![r.1],
+                day,
+                sessions: vec![entry],
             });
         }
     }
@@ -926,6 +1242,573 @@ fn set_pricing(rows: Vec<PricingRow>) -> Result<(), String> {
     Ok(())
 }
 
+// ─── AI session tagging (Feature 3) ─────────────────────────────────────────
+// One structured call over a session's recap + metadata → strict JSON → server-
+// side validation → persist. Transport is the headless local `claude` CLI
+// (claude.rs), not an HTTP client. Auto fields never clobber a hand-edited
+// field (manual_fields protection); a hand edit adds the field to that list.
+//
+// manual_fields stores the *camelCase* field identifiers ("areaOfLife",
+// "projectShortName", "goalCompleted", "completionPct") so the frontend can
+// check membership directly against its field keys.
+
+/// Context assembled from the DB for one session, fed into the tag prompt.
+struct TagContext {
+    title: String,
+    project: String,
+    message_count: i64,
+    duration_ms: i64,
+    recap: Option<String>,
+    todos_total: i64,
+    todos_done: i64,
+}
+
+/// Validated tag values after server-side checks (area in vocab, pct clamped,
+/// short name trimmed + truncated). The shape we actually persist.
+#[derive(Debug)]
+struct ValidatedTags {
+    area_of_life: String,
+    project_short_name: String,
+    goal_completed: bool,
+    completion_pct: i64,
+    rationale: String,
+}
+
+fn db_err(e: impl std::fmt::Display) -> TagError {
+    TagError::new("db", e.to_string())
+}
+
+/// Case-normalize an area against the controlled vocabulary. None if not a
+/// member (rejected server-side; the model does not get to invent areas).
+fn normalize_area(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    AREAS_OF_LIFE
+        .iter()
+        .find(|a| a.eq_ignore_ascii_case(t))
+        .map(|a| a.to_string())
+}
+
+/// Add a field name to a manual_fields list, deduped. Pure so it is unit-tested.
+fn with_manual_field(mut manual: Vec<String>, field: &str) -> Vec<String> {
+    if !manual.iter().any(|m| m == field) {
+        manual.push(field.to_string());
+    }
+    manual
+}
+
+/// Pull the first `{`…last `}` JSON object out of the model's result text.
+/// Models sometimes wrap JSON in prose or ```json fences; this tolerates that.
+/// Anything that still fails to parse → typed "invalid_json", never a silent
+/// pass.
+fn extract_json_object(text: &str) -> Result<serde_json::Value, TagError> {
+    let (start, end) = match (text.find('{'), text.rfind('}')) {
+        (Some(s), Some(e)) if e > s => (s, e),
+        _ => return Err(TagError::new("invalid_json", "model output contained no JSON object")),
+    };
+    serde_json::from_str(&text[start..=end])
+        .map_err(|e| TagError::new("invalid_json", format!("model JSON did not parse: {e}")))
+}
+
+/// Validate + normalize the model's JSON object into ValidatedTags. Every
+/// missing/ill-typed field, or an area outside the vocabulary, → "invalid_json".
+fn validate_tags(v: &serde_json::Value) -> Result<ValidatedTags, TagError> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| TagError::new("invalid_json", "expected a JSON object"))?;
+
+    let area_raw = obj
+        .get("area_of_life")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| TagError::new("invalid_json", "missing/invalid area_of_life"))?;
+    let area_of_life = normalize_area(area_raw).ok_or_else(|| {
+        TagError::new("invalid_json", format!("area_of_life '{area_raw}' not in vocabulary"))
+    })?;
+
+    let name_raw = obj
+        .get("project_short_name")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| TagError::new("invalid_json", "missing/invalid project_short_name"))?;
+    let trimmed = name_raw.trim();
+    if trimmed.is_empty() {
+        return Err(TagError::new("invalid_json", "project_short_name was empty"));
+    }
+    let project_short_name: String = trimmed.chars().take(24).collect();
+
+    let goal_completed = obj
+        .get("goal_completed")
+        .and_then(|x| x.as_bool())
+        .ok_or_else(|| TagError::new("invalid_json", "missing/invalid goal_completed"))?;
+
+    let pct_val = obj
+        .get("completion_pct")
+        .ok_or_else(|| TagError::new("invalid_json", "missing completion_pct"))?;
+    // Accept int or float (models sometimes emit 85.0); round, then clamp 0-100.
+    let pct = pct_val
+        .as_i64()
+        .or_else(|| pct_val.as_f64().map(|f| f.round() as i64))
+        .ok_or_else(|| TagError::new("invalid_json", "completion_pct was not a number"))?
+        .clamp(0, 100);
+
+    let rationale = obj
+        .get("rationale")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    Ok(ValidatedTags {
+        area_of_life,
+        project_short_name,
+        goal_completed,
+        completion_pct: pct,
+        rationale,
+    })
+}
+
+/// Compact classification prompt: the controlled vocabulary + the session's
+/// recap and metadata, demanding ONLY a strict JSON object.
+// ponytail: ~450 in / ~70 out tok per call ≈ $0.075/100 sessions on Haiku (input
+// $1/M, output $5/M) — vs the CLI's measured $1.89/100. Over the $0.05 soft target;
+// batching (backfill) is the lever if it ever needs to go lower.
+fn build_tag_prompt(ctx: &TagContext) -> String {
+    let areas = AREAS_OF_LIFE.join(", ");
+    let recap = ctx.recap.as_deref().unwrap_or("(no recap was captured for this session)");
+    format!(
+        "You are triaging one Claude Code coding session. Classify it from its \
+recap and metadata.\n\n\
+Metadata:\n\
+- Title: {title}\n\
+- Project: {project}\n\
+- Messages: {msgs}\n\
+- Duration (ms): {dur}\n\
+- Todos completed: {done}/{total}\n\n\
+Recap (auto-generated summary of what happened):\n{recap}\n\n\
+Return ONLY a strict JSON object, no prose and no markdown fences, with EXACTLY \
+these five keys:\n\
+{{\n\
+  \"area_of_life\": one of [{areas}],\n\
+  \"project_short_name\": a SHORT human name for the project, never a path, at most 24 characters,\n\
+  \"goal_completed\": true or false,\n\
+  \"completion_pct\": an integer from 0 to 100,\n\
+  \"rationale\": one sentence justifying the completion judgement\n\
+}}",
+        title = ctx.title,
+        project = ctx.project,
+        msgs = ctx.message_count,
+        dur = ctx.duration_ms,
+        done = ctx.todos_done,
+        total = ctx.todos_total,
+        recap = recap,
+        areas = areas,
+    )
+}
+
+/// Load the recap + metadata used to build the tag prompt.
+fn load_tag_context(conn: &rusqlite::Connection, id: &str) -> Result<TagContext, TagError> {
+    let (title, cwd, message_count, duration_ms, recap): (String, String, i64, i64, Option<String>) =
+        conn.query_row(
+            "SELECT COALESCE(s.title,''), s.cwd, s.message_count, s.duration_ms,
+                    (SELECT content FROM recaps r WHERE r.session_id = s.id AND r.is_final = 1)
+             FROM sessions s WHERE s.id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .map_err(db_err)?;
+    let (todos_total, todos_done): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END),0)
+             FROM todos WHERE session_id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    Ok(TagContext {
+        title,
+        project: project_display(&cwd),
+        message_count,
+        duration_ms,
+        // ponytail: cap recap at ~1200 chars (~300 tok) — classification reads the
+        // lead, not the tail. Ceiling: a very long session's tail is dropped;
+        // upgrade = head+tail slice or a pre-summary if quality dips.
+        recap: recap.map(|r| r.chars().take(1200).collect()),
+        todos_total,
+        todos_done,
+    })
+}
+
+/// Read the current manual_fields list for a session (empty if unset/invalid).
+fn load_manual_fields(conn: &rusqlite::Connection, id: &str) -> Vec<String> {
+    let raw: Option<String> = conn
+        .query_row("SELECT manual_fields FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
+        .ok()
+        .flatten();
+    parse_manual_fields(raw)
+}
+
+/// Read back the persisted tag fields as the wire struct.
+fn read_session_tags(conn: &rusqlite::Connection, id: &str) -> Result<SessionTags, TagError> {
+    conn.query_row(
+        "SELECT area_of_life, project_short_name, goal_completed, completion_pct,
+                tag_rationale, tagged_at, manual_fields
+         FROM sessions WHERE id = ?1",
+        params![id],
+        |r| {
+            Ok(SessionTags {
+                area_of_life: r.get(0)?,
+                project_short_name: r.get(1)?,
+                goal_completed: r.get::<_, Option<i64>>(2)?.map(|v| v != 0),
+                completion_pct: r.get(3)?,
+                tag_rationale: r.get(4)?,
+                tagged_at: r.get(5)?,
+                manual_fields: parse_manual_fields(r.get(6)?),
+            })
+        },
+    )
+    .map_err(db_err)
+}
+
+/// Persist auto tags: write each auto field ONLY where its camelCase name is
+/// NOT in manual_fields (hand-edit protection). tag_rationale + tagged_at are
+/// always written (tagged_at is not user-editable).
+fn persist_auto_tags(
+    conn: &rusqlite::Connection,
+    id: &str,
+    v: &ValidatedTags,
+) -> Result<SessionTags, TagError> {
+    let manual = load_manual_fields(conn, id);
+    let auto = |field: &str| !manual.iter().any(|m| m == field);
+
+    if auto("areaOfLife") {
+        conn.execute(
+            "UPDATE sessions SET area_of_life = ?1 WHERE id = ?2",
+            params![v.area_of_life, id],
+        )
+        .map_err(db_err)?;
+    }
+    if auto("projectShortName") {
+        conn.execute(
+            "UPDATE sessions SET project_short_name = ?1 WHERE id = ?2",
+            params![v.project_short_name, id],
+        )
+        .map_err(db_err)?;
+    }
+    if auto("goalCompleted") {
+        conn.execute(
+            "UPDATE sessions SET goal_completed = ?1 WHERE id = ?2",
+            params![v.goal_completed as i64, id],
+        )
+        .map_err(db_err)?;
+    }
+    if auto("completionPct") {
+        conn.execute(
+            "UPDATE sessions SET completion_pct = ?1 WHERE id = ?2",
+            params![v.completion_pct, id],
+        )
+        .map_err(db_err)?;
+    }
+    conn.execute(
+        "UPDATE sessions SET tag_rationale = ?1, tagged_at = ?2 WHERE id = ?3",
+        params![v.rationale, chrono::Utc::now().to_rfc3339(), id],
+    )
+    .map_err(db_err)?;
+
+    read_session_tags(conn, id)
+}
+
+/// Core (blocking) tag flow: load context → CLI → validate → persist. Split out
+/// so the async command wraps it in spawn_blocking and the ignored integration
+/// test can call it directly.
+fn tag_session_blocking(id: &str) -> Result<SessionTags, TagError> {
+    let conn = db::open().map_err(db_err)?;
+    let ctx = load_tag_context(&conn, id)?;
+    let prompt = build_tag_prompt(&ctx);
+    // Fast path: direct API. Degrade to the CLI (its own OAuth auth, slower) when no
+    // key or a transient transport failure. A 4xx/429 surfaces typed — retrying on the
+    // CLI won't help and would double-spend.
+    let result_text = match anthropic::tag_via_api(&prompt, TAGGING_MODEL) {
+        Ok(t) => t,
+        Err(e) if matches!(e.kind.as_str(), "no_api_key" | "timeout" | "api_http") => {
+            claude::run_headless(&prompt, TAGGING_MODEL)?
+        }
+        Err(e) => return Err(e),
+    };
+    let json = extract_json_object(&result_text)?;
+    let validated = validate_tags(&json)?;
+    persist_auto_tags(&conn, id, &validated)
+}
+
+/// One-shot AI tag. Async so the UI stays responsive; the blocking CLI call
+/// runs on the blocking pool (tauri::async_runtime, no tokio dependency added).
+#[tauri::command]
+async fn tag_session(id: String) -> Result<SessionTags, TagError> {
+    tauri::async_runtime::spawn_blocking(move || tag_session_blocking(&id))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("tag task failed to join: {e}")))?
+}
+
+// ─── Bulk backfill (Feature 3b) ─────────────────────────────────────────────
+// Tag every untagged session over the direct-API path, concurrently. Resumable
+// via `WHERE tagged_at IS NULL` — a crash just re-queries the remainder. No CLI
+// fallback here: a backfill can't afford 11s-per-failure.
+
+/// Backfill report returned to the UI. camelCase over the wire (mirror in ipc.ts).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackfillReport {
+    tagged: usize,
+    failed: usize,
+    skipped_no_key: bool,
+}
+
+const BACKFILL_WORKERS: usize = 6;
+
+/// Tag one session via the API path only (no CLI fallback). Shares every downstream
+/// step with tag_session_blocking, so tag quality + manual-field protection are identical.
+fn tag_one_via_api(conn: &rusqlite::Connection, id: &str) -> Result<(), TagError> {
+    let ctx = load_tag_context(conn, id)?;
+    let prompt = build_tag_prompt(&ctx);
+    let text = anthropic::tag_via_api(&prompt, TAGGING_MODEL)?;
+    let json = extract_json_object(&text)?;
+    let validated = validate_tags(&json)?;
+    persist_auto_tags(conn, id, &validated)?;
+    Ok(())
+}
+
+fn backfill_blocking(app: tauri::AppHandle) -> Result<BackfillReport, TagError> {
+    if !anthropic::has_api_key() {
+        return Ok(BackfillReport { tagged: 0, failed: 0, skipped_no_key: true });
+    }
+    let conn = db::open().map_err(db_err)?;
+    // Resumable: only untagged rows. A crash mid-run just re-queries the rest; a
+    // completed row (tagged_at set) drops out. No progress table needed.
+    let ids: Vec<String> = conn
+        .prepare("SELECT id FROM sessions WHERE tagged_at IS NULL")
+        .map_err(db_err)?
+        .query_map([], |r| r.get(0))
+        .map_err(db_err)?
+        .filter_map(Result::ok)
+        .collect();
+    drop(conn);
+
+    let total = ids.len();
+    let done = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+
+    // ponytail: fixed worker count, chunk-and-join — no semaphore/pool crate. Each
+    // worker owns a contiguous slice + its own DB connection (WAL serializes the tiny
+    // writes; contention is trivial next to the ~1s network call).
+    // Ceiling: no per-session batching, so ~$0.075/100 (~1.5x the $0.05 soft target);
+    // upgrade path = batch N ids per API call to amortize the instruction prefix.
+    let chunk = total.div_ceil(BACKFILL_WORKERS.max(1)).max(1);
+    std::thread::scope(|s| {
+        for group in ids.chunks(chunk) {
+            let (app, done, failed) = (app.clone(), done.clone(), failed.clone());
+            s.spawn(move || {
+                let conn = match db::open() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                for id in group {
+                    match tag_one_via_api(&conn, id) {
+                        Ok(()) => done.fetch_add(1, Ordering::Relaxed),
+                        Err(_) => failed.fetch_add(1, Ordering::Relaxed),
+                    };
+                    let n = done.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed);
+                    let _ = app.emit("backfill_progress", (n, total));
+                }
+            });
+        }
+    });
+
+    Ok(BackfillReport {
+        tagged: done.load(Ordering::Relaxed),
+        failed: failed.load(Ordering::Relaxed),
+        skipped_no_key: false,
+    })
+}
+
+/// Tag every untagged session concurrently. Resumable, no CLI fallback. Returns
+/// `skippedNoKey: true` (a no-op) when no ANTHROPIC_API_KEY is available.
+#[tauri::command]
+async fn backfill_tags(app: tauri::AppHandle) -> Result<BackfillReport, TagError> {
+    tauri::async_runtime::spawn_blocking(move || backfill_blocking(app))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("backfill task failed to join: {e}")))?
+}
+
+/// Hand-edit path: apply ONLY the provided fields, validate, and flag each
+/// edited field in manual_fields (deduped) so a future auto-tag won't clobber
+/// it. Synchronous — no CLI involved.
+#[tauri::command]
+fn update_session_tags(
+    id: String,
+    area_of_life: Option<String>,
+    project_short_name: Option<String>,
+    goal_completed: Option<bool>,
+    completion_pct: Option<i64>,
+) -> Result<SessionTags, TagError> {
+    let conn = db::open().map_err(db_err)?;
+    let mut manual = load_manual_fields(&conn, &id);
+
+    if let Some(area) = area_of_life {
+        let norm = normalize_area(&area).ok_or_else(|| {
+            TagError::new("invalid_json", format!("area '{area}' not in vocabulary"))
+        })?;
+        conn.execute("UPDATE sessions SET area_of_life = ?1 WHERE id = ?2", params![norm, id])
+            .map_err(db_err)?;
+        manual = with_manual_field(manual, "areaOfLife");
+    }
+    if let Some(name) = project_short_name {
+        let n: String = name.trim().chars().take(24).collect();
+        conn.execute("UPDATE sessions SET project_short_name = ?1 WHERE id = ?2", params![n, id])
+            .map_err(db_err)?;
+        manual = with_manual_field(manual, "projectShortName");
+    }
+    if let Some(goal) = goal_completed {
+        conn.execute(
+            "UPDATE sessions SET goal_completed = ?1 WHERE id = ?2",
+            params![goal as i64, id],
+        )
+        .map_err(db_err)?;
+        manual = with_manual_field(manual, "goalCompleted");
+    }
+    if let Some(pct) = completion_pct {
+        let pct = pct.clamp(0, 100);
+        conn.execute("UPDATE sessions SET completion_pct = ?1 WHERE id = ?2", params![pct, id])
+            .map_err(db_err)?;
+        manual = with_manual_field(manual, "completionPct");
+    }
+
+    let mf = serde_json::to_string(&manual).unwrap_or_else(|_| "[]".to_string());
+    conn.execute("UPDATE sessions SET manual_fields = ?1 WHERE id = ?2", params![mf, id])
+        .map_err(db_err)?;
+
+    read_session_tags(&conn, &id)
+}
+
+// ─── Kanban board (Feature 4) ────────────────────────────────────────────────
+// The board columns are derived from completion, with an explicit drag override
+// that wins. Membership + placement is computed on the frontend from the same
+// SessionCard fields; this pure helper mirrors that rule so the derivation has
+// unit coverage, and set_kanban persists the drag (status + per-column order).
+
+/// The three board columns, in order. The canonical status strings.
+const KANBAN_COLUMNS: [&str; 3] = ["planned", "in_progress", "completed"];
+
+/// Derive a session's board column: override-wins, then the completion rule,
+/// then None for untagged (which keeps it off the board entirely).
+///
+/// Rule: an explicit `kanban_status` (set by a drag) overrides everything. With
+/// no override, a session with no completion signal at all (pct null AND
+/// goal_completed null) is untagged → None. Otherwise: goal_completed OR pct>=100
+/// → completed, pct==0 → planned, 1..=99 → in_progress.
+///
+/// Membership is computed client-side (`columnOf` in KanbanBoard.tsx) so the
+/// board reacts without a round-trip; this mirrors that rule and carries the
+/// unit coverage the spec requires, so the derivation can't silently drift.
+#[cfg_attr(not(test), allow(dead_code))]
+fn derive_kanban_column(
+    completion_pct: Option<i64>,
+    goal_completed: Option<bool>,
+    kanban_status: Option<&str>,
+) -> Option<&'static str> {
+    // Override-wins: a drag-set status beats the derived column.
+    if let Some(s) = kanban_status {
+        return KANBAN_COLUMNS.into_iter().find(|c| *c == s);
+    }
+    // Untagged (no override, no completion signal) stays off the board.
+    if completion_pct.is_none() && goal_completed.is_none() {
+        return None;
+    }
+    if goal_completed == Some(true) || completion_pct.unwrap_or(0) >= 100 {
+        Some("completed")
+    } else if completion_pct.unwrap_or(0) == 0 {
+        Some("planned")
+    } else {
+        Some("in_progress")
+    }
+}
+
+/// Persist a drag: set the explicit `kanban_status` override (None clears it,
+/// falling back to the derived column) and the per-column `kanban_order`.
+/// Validates the status against the controlled column set.
+#[tauri::command]
+fn set_kanban(id: String, status: Option<String>, order: Option<f64>) -> Result<(), String> {
+    if let Some(s) = &status {
+        if !KANBAN_COLUMNS.contains(&s.as_str()) {
+            return Err(format!("invalid kanban status: {s}"));
+        }
+    }
+    let conn = db::open().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE sessions SET kanban_status = ?1, kanban_order = ?2 WHERE id = ?3",
+        params![status, order, id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ─── Timeline digest (P6) ────────────────────────────────────────────────────
+// A read-only weekly reconstruction surface. get_timeline computes the day
+// skeleton in SQL/Rust (never the LLM) and joins in stored digests + threads.
+// digest_session / digest_pending fill per-session slots; link_threads runs the
+// second-phase linking pass over ONLY existing digest rows. All validation +
+// referential checks live in digest.rs; the frontend reads only from the store.
+
+/// Read-only timeline: full day skeleton (gap days included), stored digests,
+/// and threads intersecting the window. No LLM.
+#[tauri::command]
+fn get_timeline(days: u32) -> Result<TimelineResponse, TagError> {
+    let conn = db::open().map_err(db_err)?;
+    digest::build_timeline(&conn, days)
+}
+
+/// Generate-or-return-cached digest for one session. Async so the UI stays
+/// responsive; the blocking HTTP call runs on the blocking pool, like tag_session.
+/// No recap rows → typed "no_recap".
+#[tauri::command]
+async fn digest_session(id: String) -> Result<SessionDigest, TagError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db::open().map_err(db_err)?;
+        digest::generate_or_cache(&conn, &id, true).map(|o| o.into_inner())
+    })
+    .await
+    .map_err(|e| TagError::new("cli_failed", format!("digest task failed to join: {e}")))?
+}
+
+/// Backfill digests for the window: generate the missing/stale/hash-changed,
+/// bounded concurrency of 4, never aborting on one failure. No-recap sessions
+/// are a truthful skip.
+#[tauri::command]
+async fn digest_pending(days: u32) -> Result<DigestBatchReport, TagError> {
+    tauri::async_runtime::spawn_blocking(move || digest::digest_pending_blocking(days))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("digest_pending task failed to join: {e}")))?
+}
+
+/// Second-phase linking pass: group window sessions whose digests continue one
+/// arc. Every member id is validated against the input set; replace-not-append.
+#[tauri::command]
+async fn link_threads(days: u32) -> Result<Vec<Thread>, TagError> {
+    tauri::async_runtime::spawn_blocking(move || digest::link_threads_blocking(days))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("link_threads task failed to join: {e}")))?
+}
+
+/// Manual-edit path: apply only the provided fields, validate to the same
+/// limits, and flag each edited field in manual_fields so auto-regeneration
+/// won't clobber it. Synchronous — no LLM involved.
+#[tauri::command]
+fn update_session_digest(
+    id: String,
+    worked_on: Option<String>,
+    outcome: Option<String>,
+    open_loops: Option<Vec<String>>,
+) -> Result<SessionDigest, TagError> {
+    let conn = db::open().map_err(db_err)?;
+    digest::update_digest(&conn, &id, worked_on, outcome, open_loops)
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 // Pure-logic probes for the ranker + snippet extractor. The DB-backed
 // search_recaps is exercised end-to-end via the running app; these cover the
@@ -934,6 +1817,152 @@ fn set_pricing(rows: Vec<PricingRow>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dir_blacklisted_and_count_match_indexer_dual_check() {
+        // Mixed dataset: two rows under a blacklisted tree (one matched by cwd,
+        // one only unambiguous in encoded space), plus an innocent sibling.
+        let pairs = vec![
+            (
+                "/Users/s/Projects/udacity-project-reviews".to_string(),
+                "-Users-s-Projects-udacity-project-reviews".to_string(),
+            ),
+            (
+                "/Users/s/Projects/udacity-project-reviews/sub".to_string(),
+                "-Users-s-Projects-udacity-project-reviews-sub".to_string(),
+            ),
+            (
+                "/Users/s/Projects/brain".to_string(),
+                "-Users-s-Projects-brain".to_string(),
+            ),
+        ];
+        let patterns = vec!["udacity-project-reviews/**".to_string()];
+
+        // Predicate: parent + descendant hidden, sibling kept.
+        assert!(dir_blacklisted(&pairs[0].0, &pairs[0].1, &patterns));
+        assert!(dir_blacklisted(&pairs[1].0, &pairs[1].1, &patterns));
+        assert!(!dir_blacklisted(&pairs[2].0, &pairs[2].1, &patterns));
+
+        // Count: exactly the two hidden rows.
+        assert_eq!(count_matches(&pairs, "udacity-project-reviews/**"), 2);
+        assert_eq!(count_matches(&pairs, "brain"), 1);
+        assert_eq!(count_matches(&pairs, "nonexistent"), 0);
+        // Empty pattern list hides nothing.
+        assert!(!dir_blacklisted(&pairs[0].0, &pairs[0].1, &[]));
+    }
+
+    #[test]
+    fn next_action_marker_mid_paragraph() {
+        // Marker sits mid-recap; we take the remainder of its line, not the prose
+        // before it, and stop at the line break.
+        let recap = "We shipped the parser and cleaned up the tests.\n\
+                     Next steps: wire the frontend to the new field.\n\
+                     Nothing else outstanding.";
+        assert_eq!(
+            extract_next_action(recap).as_deref(),
+            Some("wire the frontend to the new field.")
+        );
+    }
+
+    #[test]
+    fn next_action_is_your_call_phrasing() {
+        // The "Next action is ..." variant has no colon; the "your call:" prefix is
+        // kept verbatim per spec (we return the remainder as-is).
+        let recap = "Summary of the session.\nNext action is your call: review the PR then merge.";
+        assert_eq!(
+            extract_next_action(recap).as_deref(),
+            Some("your call: review the PR then merge.")
+        );
+    }
+
+    #[test]
+    fn next_action_none_when_no_marker() {
+        // No marker anywhere → None, never an empty string.
+        let recap = "Refactored the indexer and added a couple of tests. All green.";
+        assert_eq!(extract_next_action(recap), None);
+        // A marker followed by only whitespace also yields None.
+        assert_eq!(extract_next_action("Next:   \n"), None);
+    }
+
+    #[test]
+    fn next_action_whitespace_normalized_and_case_insensitive() {
+        // Case-insensitive marker match; internal whitespace runs collapse to one
+        // space and the result is trimmed.
+        let recap = "NEXT ACTION:    deploy   the\tbuild   to staging  ";
+        assert_eq!(
+            extract_next_action(recap).as_deref(),
+            Some("deploy the build to staging")
+        );
+    }
+
+    #[test]
+    fn preview_counts_distinct_projects_and_sessions() {
+        // Two sessions in one hidden project, one in another, one innocent.
+        let pairs = vec![
+            (
+                "/Users/s/tmp/stu_1340".to_string(),
+                "-Users-s-tmp-stu_1340".to_string(),
+            ),
+            (
+                "/Users/s/tmp/stu_1340/sub".to_string(),
+                "-Users-s-tmp-stu_1340-sub".to_string(),
+            ),
+            (
+                "/Users/s/tmp/stu_169".to_string(),
+                "-Users-s-tmp-stu_169".to_string(),
+            ),
+            (
+                "/Users/s/Projects/brain".to_string(),
+                "-Users-s-Projects-brain".to_string(),
+            ),
+        ];
+        // A tree pattern spans multiple projects; sessions count every row.
+        assert_eq!(preview_counts(&pairs, "/Users/s/tmp"), (3, 3));
+        // A single-project pattern: descendant rows are distinct project dirs.
+        assert_eq!(preview_counts(&pairs, "stu_1340"), (2, 2));
+        assert_eq!(preview_counts(&pairs, "nonexistent"), (0, 0));
+    }
+
+    #[test]
+    fn blacklist_entries_sum_is_disjoint_table_match_plus_skip_tally() {
+        // Minimal schema: the two tables blacklist_entries reads.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (cwd TEXT, project_dir TEXT, file_path TEXT);
+             CREATE TABLE project_blacklist (pattern TEXT PRIMARY KEY, created_at TEXT, skipped_count INTEGER DEFAULT 0);",
+        )
+        .unwrap();
+
+        // Source (a): one indexed-but-filtered session under the hidden tree,
+        // plus an innocent sibling that must NOT be counted.
+        conn.execute(
+            "INSERT INTO sessions (cwd, project_dir, file_path)
+             VALUES ('/Users/s/Projects/foo', '-Users-s-Projects-foo', '/a.jsonl')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (cwd, project_dir, file_path)
+             VALUES ('/Users/s/Projects/bar', '-Users-s-Projects-bar', '/b.jsonl')",
+            [],
+        )
+        .unwrap();
+
+        // Source (b): three files skipped at scan time (never in `sessions`),
+        // persisted by the indexer as the per-pattern skip tally.
+        conn.execute(
+            "INSERT INTO project_blacklist (pattern, created_at, skipped_count)
+             VALUES ('foo/**', '2026-01-01T00:00:00Z', 3)",
+            [],
+        )
+        .unwrap();
+
+        let entries = blacklist_entries(&conn).unwrap();
+        assert_eq!(entries.len(), 1);
+        // (a)=1 table match + (b)=3 skipped = 4; the bar session is excluded and
+        // nothing is double-counted.
+        assert_eq!(entries[0].match_count, 4);
+    }
 
     #[test]
     fn tokenize_splits_on_punctuation_and_lowercases() {
@@ -1022,6 +2051,7 @@ mod tests {
                     cwd: "/p/brain".into(),
                     captured_ts: Some(ts.into()),
                     content: content.into(),
+                    project_dir: "-p-brain".into(),
                 },
                 &["auth".to_string()],
                 now,
@@ -1042,6 +2072,97 @@ mod tests {
             "dense TF must outscore sparse (same recency): recent={} sparse={}",
             recent.score, sparse.score
         );
+    }
+
+    // ─── Tagging pure logic ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_json_object_handles_fences_and_prefix() {
+        // Fenced.
+        let fenced = "```json\n{\"area_of_life\":\"Building\"}\n```";
+        assert!(extract_json_object(fenced).is_ok());
+        // Prose prefix + suffix.
+        let prosey = "Sure, here you go: {\"completion_pct\": 40} — hope that helps!";
+        let v = extract_json_object(prosey).unwrap();
+        assert_eq!(v.get("completion_pct").and_then(|x| x.as_i64()), Some(40));
+        // No object at all.
+        assert_eq!(extract_json_object("no json here").unwrap_err().kind, "invalid_json");
+    }
+
+    #[test]
+    fn validate_tags_rejects_bad_area_and_clamps_pct() {
+        // Valid, case-insensitive area + float pct rounds and passes.
+        let ok = serde_json::json!({
+            "area_of_life": "building",
+            "project_short_name": "  sessions-ui  ",
+            "goal_completed": true,
+            "completion_pct": 84.6,
+            "rationale": "shipped it"
+        });
+        let v = validate_tags(&ok).unwrap();
+        assert_eq!(v.area_of_life, "Building"); // normalized to canonical casing
+        assert_eq!(v.project_short_name, "sessions-ui"); // trimmed
+        assert_eq!(v.completion_pct, 85); // rounded
+
+        // Pct out of range clamps.
+        let hi = serde_json::json!({
+            "area_of_life": "Ops", "project_short_name": "x",
+            "goal_completed": false, "completion_pct": 250, "rationale": ""
+        });
+        assert_eq!(validate_tags(&hi).unwrap().completion_pct, 100);
+
+        // Area outside the vocabulary is rejected.
+        let bad = serde_json::json!({
+            "area_of_life": "Gardening", "project_short_name": "x",
+            "goal_completed": false, "completion_pct": 0, "rationale": ""
+        });
+        assert_eq!(validate_tags(&bad).unwrap_err().kind, "invalid_json");
+
+        // Empty short name is rejected.
+        let empty = serde_json::json!({
+            "area_of_life": "Ops", "project_short_name": "   ",
+            "goal_completed": false, "completion_pct": 0, "rationale": ""
+        });
+        assert_eq!(validate_tags(&empty).unwrap_err().kind, "invalid_json");
+    }
+
+    #[test]
+    fn validate_tags_truncates_long_short_name() {
+        let long = serde_json::json!({
+            "area_of_life": "Building",
+            "project_short_name": "this-is-a-very-long-project-name-way-over-limit",
+            "goal_completed": true, "completion_pct": 10, "rationale": "x"
+        });
+        assert_eq!(validate_tags(&long).unwrap().project_short_name.chars().count(), 24);
+    }
+
+    #[test]
+    fn derive_kanban_column_implements_override_wins_and_pct_rule() {
+        // Pct rule: 0 → planned, mid → in_progress, 100 → completed.
+        assert_eq!(derive_kanban_column(Some(0), Some(false), None), Some("planned"));
+        assert_eq!(derive_kanban_column(Some(50), Some(false), None), Some("in_progress"));
+        assert_eq!(derive_kanban_column(Some(100), Some(false), None), Some("completed"));
+        // goal_completed true → completed regardless of pct.
+        assert_eq!(derive_kanban_column(Some(30), Some(true), None), Some("completed"));
+        // Override beats the %: a drag to planned holds even at 100%.
+        assert_eq!(derive_kanban_column(Some(100), Some(true), Some("planned")), Some("planned"));
+        assert_eq!(derive_kanban_column(Some(0), None, Some("completed")), Some("completed"));
+        // All-null (untagged, no override) → off the board.
+        assert_eq!(derive_kanban_column(None, None, None), None);
+        // Tagged only via goal_completed=false, no pct → treated as planned.
+        assert_eq!(derive_kanban_column(None, Some(false), None), Some("planned"));
+    }
+
+    #[test]
+    fn with_manual_field_dedups() {
+        let m = with_manual_field(vec![], "completionPct");
+        assert_eq!(m, vec!["completionPct".to_string()]);
+        // Re-adding is a no-op.
+        let m = with_manual_field(m, "completionPct");
+        assert_eq!(m, vec!["completionPct".to_string()]);
+        // A different field appends.
+        let m = with_manual_field(m, "areaOfLife");
+        assert_eq!(m, vec!["completionPct".to_string(), "areaOfLife".to_string()]);
     }
 
     /// End-to-end probe against the real indexed DB. Ignored by default
@@ -1087,6 +2208,91 @@ mod tests {
             );
         }
     }
+
+    /// Real CLI round-trip against the indexed DB. Ignored by default (spends
+    /// real haiku tokens + needs a populated index). Run with:
+    ///   cargo test --lib tag_session_against_real_db -- --ignored --nocapture
+    /// Confirms: valid JSON parsed, fields persisted, and a manually-set field
+    /// survives a re-tag (manual_fields protection).
+    #[test]
+    #[ignore]
+    fn tag_session_against_real_db() {
+        let conn = db::open().expect("open db");
+        let id: String = conn
+            .query_row(
+                "SELECT s.id FROM sessions s
+                 WHERE EXISTS (SELECT 1 FROM recaps r WHERE r.session_id = s.id AND r.is_final = 1)
+                 ORDER BY s.last_ts DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("need at least one recap-bearing session");
+        println!("tagging real session {id}");
+
+        // Set completion_pct by hand FIRST — it must survive the auto-tag below.
+        let before = update_session_tags(id.clone(), None, None, None, Some(42))
+            .expect("manual update ok");
+        assert_eq!(before.completion_pct, Some(42));
+        assert!(before.manual_fields.contains(&"completionPct".to_string()));
+
+        // Run the real one-shot AI tag.
+        let tags = tag_session_blocking(&id).expect("tag_session core ok");
+        println!(
+            "MODEL OUTPUT → area={:?} shortName={:?} goalCompleted={:?} completionPct={:?}\n  rationale={:?}\n  manualFields={:?}",
+            tags.area_of_life,
+            tags.project_short_name,
+            tags.goal_completed,
+            tags.completion_pct,
+            tags.tag_rationale,
+            tags.manual_fields,
+        );
+
+        // Auto fields populated + valid.
+        let area = tags.area_of_life.as_deref().expect("area set");
+        assert!(AREAS_OF_LIFE.contains(&area), "area '{area}' must be in vocabulary");
+        assert!(tags.project_short_name.is_some(), "short name set");
+        assert!(tags.tag_rationale.is_some(), "rationale set");
+        assert!(tags.tagged_at.is_some(), "tagged_at set");
+
+        // The hand-edited completion_pct must NOT have been clobbered.
+        assert_eq!(tags.completion_pct, Some(42), "manual completion_pct must survive re-tag");
+        assert!(tags.manual_fields.contains(&"completionPct".to_string()));
+    }
+
+    /// Persistence probe for the kanban drag path against the real indexed DB.
+    /// Ignored by default (needs a populated ~/.claude-sessions-ui/index.sqlite).
+    /// Run with:
+    ///   cargo test --lib set_kanban_persists_against_real_db -- --ignored --nocapture
+    /// Drag itself can't be driven headlessly; this exercises the persistence
+    /// path set_kanban writes and reads it straight back from the row.
+    #[test]
+    #[ignore]
+    fn set_kanban_persists_against_real_db() {
+        let conn = db::open().expect("open db");
+        let id: String = conn
+            .query_row("SELECT id FROM sessions ORDER BY last_ts DESC LIMIT 1", [], |r| r.get(0))
+            .expect("need at least one session");
+
+        // A drag to In Progress at a fractional order.
+        set_kanban(id.clone(), Some("in_progress".into()), Some(1500.0)).expect("set_kanban ok");
+        let (status, order): (Option<String>, Option<f64>) = conn
+            .query_row(
+                "SELECT kanban_status, kanban_order FROM sessions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read back ok");
+        assert_eq!(status.as_deref(), Some("in_progress"));
+        assert_eq!(order, Some(1500.0));
+        println!("persisted kanban for {id}: status={status:?} order={order:?}");
+
+        // Clearing the override writes NULL, so the card falls back to derived.
+        set_kanban(id.clone(), None, None).expect("clear ok");
+        let cleared: Option<String> = conn
+            .query_row("SELECT kanban_status FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
+            .expect("read back ok");
+        assert_eq!(cleared, None, "clearing the override writes NULL");
+    }
 }
 
 // ─── App entry ──────────────────────────────────────────────────────────────
@@ -1097,7 +2303,9 @@ pub fn run() {
         .format_timestamp_secs()
         .init();
 
-    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init());
     // ponytail: WebDriver plugin is E2E-only, gated to debug builds. It still links into
     // the release binary but never initializes; ceiling — make it an optional cargo
     // feature enabled only in dev to strip it from release entirely.
@@ -1109,6 +2317,7 @@ pub fn run() {
             reindex,
             index_status,
             list_sessions,
+            list_threads,
             get_session_detail,
             search_recaps,
             digest,
@@ -1117,6 +2326,19 @@ pub fn run() {
             toggle_pin,
             get_pricing,
             set_pricing,
+            list_blacklist,
+            add_blacklist_pattern,
+            remove_blacklist_pattern,
+            preview_blacklist_pattern,
+            tag_session,
+            update_session_tags,
+            backfill_tags,
+            set_kanban,
+            get_timeline,
+            digest_session,
+            digest_pending,
+            link_threads,
+            update_session_digest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1148,11 +2370,48 @@ mod serde_tests {
             cost_usd: 0.0,
             cost_source: "none".into(),
             pinned: false,
+            area_of_life: Some("Building".into()),
+            project_short_name: Some("sessions-ui".into()),
+            goal_completed: Some(true),
+            completion_pct: Some(40),
+            tag_rationale: Some("shipped the cards".into()),
+            tagged_at: Some("2026-07-04T00:00:00Z".into()),
+            manual_fields: vec!["completionPct".into()],
+            kanban_status: Some("inProgress".into()),
+            kanban_order: Some(1.5),
+            next_action: Some("wire the frontend".into()),
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains("\"projectDir\""), "expected camelCase projectDir, got: {}", json);
         assert!(json.contains("\"messageCount\""));
         assert!(json.contains("\"cacheReadToks\""));
         assert!(!json.contains("project_dir"), "snake_case leaked: {}", json);
+        // New tag/kanban fields must also serialize camelCase.
+        assert!(json.contains("\"areaOfLife\""), "got: {}", json);
+        assert!(json.contains("\"projectShortName\""));
+        assert!(json.contains("\"goalCompleted\""));
+        assert!(json.contains("\"completionPct\""));
+        assert!(json.contains("\"tagRationale\""));
+        assert!(json.contains("\"taggedAt\""));
+        assert!(json.contains("\"manualFields\""));
+        assert!(json.contains("\"kanbanStatus\""));
+        assert!(json.contains("\"kanbanOrder\""));
+        assert!(json.contains("\"nextAction\""));
+        assert!(!json.contains("area_of_life"), "snake_case leaked: {}", json);
+    }
+
+    #[test]
+    fn manual_fields_parses_json_array_or_degrades_to_empty() {
+        assert_eq!(
+            parse_manual_fields(Some(r#"["area_of_life","completion_pct"]"#.into())),
+            vec!["area_of_life".to_string(), "completion_pct".to_string()]
+        );
+        // Empty array → empty vec.
+        assert!(parse_manual_fields(Some("[]".into())).is_empty());
+        // Null column → empty vec.
+        assert!(parse_manual_fields(None).is_empty());
+        // Invalid / non-array JSON → empty vec, never a panic.
+        assert!(parse_manual_fields(Some("not json".into())).is_empty());
+        assert!(parse_manual_fields(Some(r#"{"a":1}"#.into())).is_empty());
     }
 }

@@ -34,7 +34,8 @@ pub fn open() -> rusqlite::Result<Connection> {
 }
 
 /// Idempotent schema creation. All `CREATE IF NOT EXISTS` so re-running is safe.
-fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+/// pub(crate) so integration-style tests can land the real schema on a temp DB.
+pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // NOTE: keep field names stable — frontend & indexer depend on them.
     conn.execute_batch(
         r#"
@@ -146,6 +147,168 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
     // Seed pricing defaults once. UPDATE OR INSERT pattern via temp absence check.
     seed_pricing_if_empty(conn)?;
+    migrate_v1(conn)?;
+    migrate_v2(conn)?;
+    migrate_v3(conn)?;
+    migrate_v4(conn)?;
+    Ok(())
+}
+
+/// v1: tag-and-triage schema. Establishes the PRAGMA user_version pattern —
+/// additive steps run once, guarded by the version, then bump it. Columns are
+/// double-guarded by a presence check so an interrupted run stays idempotent.
+///
+/// Lands the FULL cross-feature schema in one step: blacklist (F1), tag fields
+/// (F3, read by F2's chips), kanban placement (F4). All tag/kanban columns are
+/// nullable — null means "untagged", which the UI renders as clean absence.
+fn migrate_v1(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 1 {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_blacklist (
+            pattern    TEXT PRIMARY KEY,   -- dir name or path, optional /** suffix
+            created_at TEXT
+        );",
+    )?;
+    // Seed inside the version gate: runs once ever, so deleting it sticks.
+    conn.execute(
+        "INSERT OR IGNORE INTO project_blacklist (pattern, created_at) VALUES (?1, ?2)",
+        rusqlite::params!["udacity-project-reviews/**", chrono::Utc::now().to_rfc3339()],
+    )?;
+
+    for (name, decl) in [
+        // F3 tag fields (F2 chips read these; absent = null = renders nothing)
+        ("area_of_life", "area_of_life TEXT"),
+        ("project_short_name", "project_short_name TEXT"),
+        ("goal_completed", "goal_completed INTEGER"),
+        ("completion_pct", "completion_pct INTEGER"),
+        ("tag_rationale", "tag_rationale TEXT"),
+        ("tagged_at", "tagged_at TEXT"),
+        ("manual_fields", "manual_fields TEXT"), // JSON array of hand-edited field names
+        // F4 board placement (override-wins vs %-derived column)
+        ("kanban_status", "kanban_status TEXT"),
+        ("kanban_order", "kanban_order REAL"),
+    ] {
+        add_column_if_missing(conn, "sessions", name, decl)?;
+    }
+
+    conn.pragma_update(None, "user_version", 1)?;
+    Ok(())
+}
+
+/// v2: heal titles mangled by the pre-fix `sanitize_title` (which blanket-stripped
+/// underscores, so "TAG_AND_TRIAGE_PROMPT.md" was persisted as "TAGANDTRIAGEPROMPT.md").
+/// The corrupted title lives in the `sessions` row, so fixing the function alone
+/// leaves stored rows wrong. Force a one-time re-derivation by zeroing every
+/// session's stored `file_mtime`: the indexer's incremental scan skips a file
+/// only when its stored mtime equals the file's real mtime, so a zeroed value
+/// guarantees a re-parse (and thus a re-sanitize) on the next pass without a
+/// wipe. The upsert rewrites only parsed fields (title, timestamps, counts…),
+/// never the tag/kanban columns, so user curation survives untouched.
+fn migrate_v2(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 2 {
+        return Ok(());
+    }
+    conn.execute("UPDATE sessions SET file_mtime = 0", [])?;
+    conn.pragma_update(None, "user_version", 2)?;
+    Ok(())
+}
+
+/// v3: honest blacklist counts. Adds `skipped_count` to `project_blacklist` — the
+/// per-pattern tally of session files the indexer skips at scan time (files that
+/// never enter `sessions`). `blacklist_entries` sums this with the table-match
+/// count so a seeded pattern (whose files were never indexed) still reports a
+/// live count. The indexer overwrites the tally each pass (see indexer::run), so
+/// on-disk deletions are reflected after the next refresh.
+fn migrate_v3(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 3 {
+        return Ok(());
+    }
+    add_column_if_missing(
+        conn,
+        "project_blacklist",
+        "skipped_count",
+        "skipped_count INTEGER DEFAULT 0",
+    )?;
+    conn.pragma_update(None, "user_version", 3)?;
+    Ok(())
+}
+
+/// v4: Timeline digest schema (P6). Three additive tables, all `CREATE IF NOT
+/// EXISTS` so an interrupted run re-runs clean, then bump user_version to 4. The
+/// LLM only ever fills `session_digests` slots + a `threads`/`thread_members`
+/// linking pass; deterministic facts (day grouping, counts) stay in SQL. Every
+/// row references `sessions(id)` ON DELETE CASCADE, so a re-index that drops a
+/// session takes its digest + thread membership with it — no orphan provenance.
+fn migrate_v4(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 4 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
+        -- One per-session digest slot. LLM output is untrusted: schema-validated
+        -- + referentially checked in Rust before it lands here. content_hash
+        -- (FNV-1a over the final recap uuid + content + prompt_version + model)
+        -- gates regeneration; manual_fields (JSON array of hand-edited field
+        -- names) protects hand-edits from auto-regeneration.
+        CREATE TABLE IF NOT EXISTS session_digests (
+            session_id     TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            content_hash   TEXT NOT NULL,
+            prompt_version INTEGER NOT NULL,
+            model          TEXT,
+            worked_on      TEXT,
+            outcome        TEXT,
+            open_loops     TEXT,        -- JSON array of strings, max 3
+            citations      TEXT,        -- JSON array of strings, may be empty
+            verified       INTEGER DEFAULT 1,
+            confidence     REAL,
+            generated_at   TEXT,
+            manual_fields  TEXT         -- JSON array of hand-edited field names
+        );
+
+        -- A narrative thread linking sessions across days. Members live in
+        -- thread_members; a session may reference only existing rows (the
+        -- linking pass validates every member id against the input set).
+        CREATE TABLE IF NOT EXISTS threads (
+            id             TEXT PRIMARY KEY,    -- uuid
+            arc            TEXT,                -- one-line narrative
+            prompt_version INTEGER NOT NULL,
+            generated_at   TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS thread_members (
+            thread_id  TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            PRIMARY KEY (thread_id, session_id)
+        );
+        "#,
+    )?;
+    conn.pragma_update(None, "user_version", 4)?;
+    Ok(())
+}
+
+/// SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS — check table_info first.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .flatten()
+        .any(|c| c == column);
+    drop(stmt);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))?;
+    }
     Ok(())
 }
 
@@ -174,6 +337,17 @@ fn seed_pricing_if_empty(conn: &Connection) -> rusqlite::Result<()> {
         stmt.execute(rusqlite::params![m, i, o, cw, cr])?;
     }
     Ok(())
+}
+
+/// All blacklist patterns, oldest first. Missing table (pre-v1 test DBs)
+/// degrades to "no blacklist" rather than an error.
+pub fn load_blacklist_patterns(conn: &Connection) -> Vec<String> {
+    conn.prepare("SELECT pattern FROM project_blacklist ORDER BY created_at")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
 }
 
 /// Read a meta value (e.g. "last_full_scan_ts").
@@ -244,5 +418,147 @@ mod tests {
             |r| r.get(0)
         ).unwrap();
         assert_eq!(recap_content, "recap body");
+    }
+
+    #[test]
+    fn migrate_v1_lands_schema_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+
+        // user_version bumped to the latest applied migration (v1 schema + v2 heal
+        // + v3 blacklist skip-tally column + v4 digest tables).
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4);
+
+        // Blacklist table exists and is seeded exactly once
+        let patterns = load_blacklist_patterns(&conn);
+        assert_eq!(patterns, vec!["udacity-project-reviews/**".to_string()]);
+
+        // All new sessions columns exist and are nullable (insert without them)
+        conn.execute(
+            "INSERT INTO sessions (id, file_path, file_mtime) VALUES ('s1', '/tmp/x.jsonl', 1)",
+            [],
+        ).unwrap();
+        let (area, pct, kanban): (Option<String>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT area_of_life, completion_pct, kanban_status FROM sessions WHERE id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(area, None);
+        assert_eq!(pct, None);
+        assert_eq!(kanban, None);
+
+        // Re-running migrate is a no-op (idempotent) and does NOT re-seed:
+        // deleting the seed must stick.
+        conn.execute("DELETE FROM project_blacklist", []).unwrap();
+        migrate(&conn).unwrap();
+        assert!(load_blacklist_patterns(&conn).is_empty(), "seed must not reappear");
+    }
+
+    #[test]
+    fn migrate_v2_zeroes_mtime_to_force_title_reheal_without_wiping_tags() {
+        // Simulate a pre-v2 DB: schema present but user_version pinned below 2,
+        // holding a session with a real mtime and user-set tag/kanban fields.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, file_path, file_mtime, title, area_of_life, completion_pct, kanban_status)
+             VALUES ('s1', '/tmp/x.jsonl', 1700000000, 'TAGANDTRIAGEPROMPT.md', 'Building', 42, 'in_progress')",
+            [],
+        ).unwrap();
+
+        // Re-run migrations: v2 should zero the mtime (forcing a re-parse) but
+        // leave every user-curated field intact.
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4);
+
+        let (mtime, area, pct, kanban): (i64, Option<String>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT file_mtime, area_of_life, completion_pct, kanban_status FROM sessions WHERE id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(mtime, 0, "mtime must be zeroed so the indexer re-derives the title");
+        assert_eq!(area.as_deref(), Some("Building"), "tags must survive the heal");
+        assert_eq!(pct, Some(42));
+        assert_eq!(kanban.as_deref(), Some("in_progress"));
+
+        // Idempotent: a second run does not re-zero (mtime a later index restored).
+        conn.execute("UPDATE sessions SET file_mtime = 1700000001 WHERE id='s1'", []).unwrap();
+        migrate(&conn).unwrap();
+        let mtime2: i64 = conn.query_row("SELECT file_mtime FROM sessions WHERE id='s1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mtime2, 1700000001, "v2 must not re-run once user_version >= 2");
+    }
+
+    #[test]
+    fn migrate_v4_lands_digest_tables_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Cascade only fires with FK enforcement on — db::open sets this pragma,
+        // but a bare in-memory connection does not, so enable it here.
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 4);
+
+        // A session to hang a digest + thread off of (FK targets must exist).
+        conn.execute(
+            "INSERT INTO sessions (id, file_path, file_mtime) VALUES ('s1', '/tmp/x.jsonl', 1)",
+            [],
+        )
+        .unwrap();
+
+        // session_digests round-trips; `verified` defaults to 1.
+        conn.execute(
+            "INSERT INTO session_digests (session_id, content_hash, prompt_version, worked_on)
+             VALUES ('s1', 'deadbeef', 1, 'refactored the indexer')",
+            [],
+        )
+        .unwrap();
+        let (worked, verified): (String, i64) = conn
+            .query_row(
+                "SELECT worked_on, verified FROM session_digests WHERE session_id='s1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(worked, "refactored the indexer");
+        assert_eq!(verified, 1, "verified defaults to 1");
+
+        // threads + thread_members, with cascade from threads.
+        conn.execute(
+            "INSERT INTO threads (id, arc, prompt_version) VALUES ('t1', 'a workstream', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thread_members (thread_id, session_id) VALUES ('t1', 's1')",
+            [],
+        )
+        .unwrap();
+        let n_members: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread_members", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_members, 1);
+
+        // Deleting the thread cascades its membership away.
+        conn.execute("DELETE FROM threads WHERE id='t1'", []).unwrap();
+        let n_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM thread_members", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_after, 0, "thread_members cascades on thread delete");
+
+        // Re-running migrate is a no-op: version holds, rows survive.
+        migrate(&conn).unwrap();
+        let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v2, 4);
+        let n_digests: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_digests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_digests, 1, "idempotent migrate must not drop rows");
     }
 }

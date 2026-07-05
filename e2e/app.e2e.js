@@ -56,6 +56,106 @@ describe('session selection', () => {
   });
 });
 
+describe('hidden projects (blacklist)', () => {
+  it('exposes a quiet control that reveals the manage panel', async () => {
+    const control = await $('[title="Hidden projects"]');
+    await control.waitForExist({ timeout: 10000 });
+    await control.click();
+    // Panel reveals: the add-pattern input is always present when open (and with
+    // zero patterns the warm guidance line shows instead of a dead zone).
+    await browser.waitUntil(
+      async () => (await $('[placeholder="e.g. project-name/**"]')).isExisting(),
+      { timeout: 10000, timeoutMsg: 'blacklist panel did not reveal its add-pattern input' },
+    );
+    await expect($('[placeholder="e.g. project-name/**"]')).toBeExisting();
+  });
+});
+
+describe('progressive-disclosure cards', () => {
+  it('expands a card in place and collapses it', async () => {
+    // Drive via browser.execute (like the backend spec) — JS clicks bypass the
+    // hover-reveal opacity + interactability waits, and single-command DOM checks
+    // keep the interaction count low.
+    const hasRows = await browser.execute(
+      () => !!document.querySelector('div[class*="cursor-pointer"][class*="rounded-lg"]'),
+    );
+    if (!hasRows) return; // no indexed data — nothing to expand, skip gracefully
+    const clicked = await browser.execute(() => {
+      const btn = document.querySelector('[title="Expand"]');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    if (!clicked) return; // no expand affordance rendered
+    // The row reveals its Tier-2 detail block.
+    await browser.waitUntil(
+      async () => browser.execute(() => !!document.querySelector('[data-card-detail]')),
+      { timeout: 10000, timeoutMsg: 'card did not reveal expanded detail after Expand' },
+    );
+    // Collapse the same way — detail block disappears.
+    await browser.execute(() => document.querySelector('[title="Collapse"]')?.click());
+    await browser.waitUntil(
+      async () => browser.execute(() => !document.querySelector('[data-card-detail]')),
+      { timeout: 10000, timeoutMsg: 'card did not collapse after Collapse' },
+    );
+  });
+});
+
+describe('AI session tagging', () => {
+  it('exposes an enabled tag control on each card (does not invoke the CLI)', async () => {
+    // Presence/enabled check only — invoking tag_session would shell out to the
+    // real claude CLI (real tokens, ~10s+). We never click it here.
+    const hasRows = await browser.execute(
+      () => !!document.querySelector('div[class*="cursor-pointer"][class*="rounded-lg"]'),
+    );
+    if (!hasRows) return; // no indexed data — nothing to tag, skip gracefully
+    const state = await browser.execute(() => {
+      const btn = document.querySelector('[title="Tag session"]');
+      return btn ? { exists: true, disabled: btn.disabled } : { exists: false };
+    });
+    expect(state.exists).toBe(true);
+    expect(state.disabled).toBe(false);
+  });
+});
+
+describe('kanban board', () => {
+  it('toggles to the board (three columns or a board-level empty state) and back to the list', async () => {
+    // Drive via browser.execute like the other specs — bypasses hover/interactability.
+    // Toggle to the board view.
+    const toBoard = await browser.execute(() => {
+      const btn = document.querySelector('[title="Board view"]');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    expect(toBoard).toBe(true);
+
+    // Either the three column headers render, or (nothing tagged) the board-level
+    // empty state invites tagging — both are valid, data-dependent, graceful.
+    await browser.waitUntil(
+      async () =>
+        browser.execute(() => {
+          // innerText reflects CSS text-transform (headers are uppercased), so
+          // compare case-insensitively.
+          const text = document.body.innerText.toLowerCase();
+          const cols =
+            text.includes('planned') && text.includes('in progress') && text.includes('completed');
+          const empty = text.includes('the board is for tagged work');
+          return cols || empty;
+        }),
+      { timeout: 10000, timeoutMsg: 'board view showed neither columns nor the empty state' },
+    );
+
+    // Toggle back to the list — the session-count heading (an <h2>, list-only) returns.
+    await browser.execute(() => document.querySelector('[title="List view"]')?.click());
+    await browser.waitUntil(
+      async () => browser.execute(() => !!document.querySelector('h2')),
+      { timeout: 10000, timeoutMsg: 'list view did not restore after toggling back from the board' },
+    );
+    await expect($('h2')).toBeExisting();
+  });
+});
+
 describe('backend', () => {
   it('has a live Tauri IPC bridge (Rust backend reachable)', async () => {
     const ok = await browser.execute(() => typeof window.__TAURI_INTERNALS__ !== 'undefined');

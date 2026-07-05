@@ -1,0 +1,52 @@
+[
+  {
+    "step": "before backfill",
+    "dayRows": 7,
+    "expandedRegions": 1,
+    "firstThreadTitle": null,
+    "l0Fits": false,
+    "politeAnnouncement": null,
+    "reportLine": null,
+    "threadRows": 0
+  },
+  {
+    "step": "after backfill",
+    "dayRows": 7,
+    "expandedRegions": 1,
+    "firstThreadTitle": null,
+    "l0Fits": false,
+    "politeAnnouncement": null,
+    "reportLine": "0 new · 1 cached · 45 failed · 27 no recap",
+    "threadRows": 0
+  },
+  {
+    "step": "newest day expanded (worked-on lines)",
+    "dayRows": 7,
+    "expandedRegions": 0,
+    "firstThreadTitle": "Design system and session-detail UI/UX for claude-sessions-ui developed in parallel with shared taste language — 2 sessions · active Sun Jul 5. Click to filter the timeline to this thread.",
+    "l0Fits": true,
+    "politeAnnouncement": "Week digested: 0 new, 1 cached",
+    "reportLine": "0 new · 1 cached · 45 failed · 27 no recap",
+    "threadRows": 1
+  },
+  {
+    "step": "thread filtered (member days auto-expanded to L1)",
+    "dayRows": 1,
+    "expandedRegions": 1,
+    "firstThreadTitle": "Design system and session-detail UI/UX for claude-sessions-ui developed in parallel with shared taste language — 2 sessions · active Sun Jul 5. Click to filter the timeline to this thread.",
+    "l0Fits": true,
+    "politeAnnouncement": "Week digested: 0 new, 1 cached",
+    "reportLine": "0 new · 1 cached · 45 failed · 27 no recap",
+    "threadRows": 1
+  },
+  {
+    "step": "open-loops flatten mode",
+    "dayRows": 0,
+    "expandedRegions": 0,
+    "firstThreadTitle": "Design system and session-detail UI/UX for claude-sessions-ui developed in parallel with shared taste language — 2 sessions · active Sun Jul 5. Click to filter the timeline to this thread.",
+    "l0Fits": true,
+    "politeAnnouncement": "Week digested: 0 new, 1 cached",
+    "reportLine": "0 new · 1 cached · 45 failed · 27 no recap",
+    "threadRows": 1
+  }
+]

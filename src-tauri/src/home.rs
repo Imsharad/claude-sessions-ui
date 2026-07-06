@@ -70,6 +70,7 @@ pub struct SessionRow {
     plan_mode: bool,
     recap: Option<String>,
     pinned: bool,
+    project_status: Option<String>, // derived (override-wins), for archived-filtering
     area_of_life: Option<String>,
     short_name: Option<String>, // normalized: None when null/blank
     goal_completed: Option<bool>,
@@ -115,6 +116,9 @@ pub fn load_session_rows(conn: &rusqlite::Connection) -> Result<Vec<SessionRow>,
                     s.message_count, s.plan_mode,
                     (SELECT content FROM recaps r WHERE r.session_id = s.id AND r.is_final = 1),
                     COALESCE((SELECT pinned FROM projects p WHERE p.encoded_dir = s.project_dir), 0),
+                    (SELECT status FROM projects p WHERE p.encoded_dir = s.project_dir),
+                    COALESCE((SELECT status_manual FROM projects p WHERE p.encoded_dir = s.project_dir), 0),
+                    (SELECT last_modified FROM projects p WHERE p.encoded_dir = s.project_dir),
                     s.area_of_life, s.project_short_name, s.goal_completed, s.completion_pct,
                     s.kanban_status,
                     (SELECT COUNT(*) FROM todos t WHERE t.session_id = s.id AND t.status != 'completed')
@@ -139,12 +143,18 @@ pub fn load_session_rows(conn: &rusqlite::Connection) -> Result<Vec<SessionRow>,
                 plan_mode: r.get::<_, i64>(7)? != 0,
                 recap: r.get(8)?,
                 pinned: r.get::<_, i64>(9)? != 0,
-                area_of_life: r.get(10)?,
-                short_name: norm_short_name(r.get(11)?),
-                goal_completed: r.get::<_, Option<i64>>(12)?.map(|v| v != 0),
-                completion_pct: r.get(13)?,
-                kanban_status: r.get(14)?,
-                open_todo_count: r.get(15)?,
+                project_status: crate::derive_project_status(
+                    r.get::<_, Option<String>>(10)?.as_deref(),
+                    r.get::<_, i64>(11)? != 0,
+                    r.get::<_, Option<String>>(12)?.as_deref(),
+                )
+                .map(|s| s.to_string()),
+                area_of_life: r.get(13)?,
+                short_name: norm_short_name(r.get(14)?),
+                goal_completed: r.get::<_, Option<i64>>(15)?.map(|v| v != 0),
+                completion_pct: r.get(16)?,
+                kanban_status: r.get(17)?,
+                open_todo_count: r.get(18)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -152,11 +162,15 @@ pub fn load_session_rows(conn: &rusqlite::Connection) -> Result<Vec<SessionRow>,
         .collect();
 
     // Defensive blacklist filter (same as list_sessions): a pattern added after
-    // indexing drops its rows this query cycle, no re-index needed.
+    // indexing drops its rows this query cycle, no re-index needed. Archived
+    // projects are hidden from Home threads + counts by the same post-filter.
     let patterns = crate::db::load_blacklist_patterns(conn);
+    let archived = crate::db::load_archived_project_dirs(conn);
     let out = rows
         .into_iter()
         .filter(|r| !dir_blacklisted(&r.cwd, &r.project_dir, &patterns))
+        .filter(|r| r.project_status.as_deref() != Some("archived"))
+        .filter(|r| !archived.contains(&r.project_dir))
         .collect();
     Ok(out)
 }
@@ -704,6 +718,7 @@ mod tests {
             plan_mode: false,
             recap: Some(format!("recap {id}")),
             pinned: false,
+            project_status: None,
             area_of_life: None,
             short_name: short_name.map(|s| s.to_string()),
             goal_completed: None,

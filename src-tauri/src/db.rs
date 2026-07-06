@@ -151,6 +151,7 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     migrate_v2(conn)?;
     migrate_v3(conn)?;
     migrate_v4(conn)?;
+    migrate_v5(conn)?;
     Ok(())
 }
 
@@ -293,6 +294,28 @@ fn migrate_v4(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// v5: Project ontology — a lifecycle status per project. Mirrors the kanban
+/// override-wins pattern (db.rs v1): `status` is the user override (null = unset,
+/// derived at read time), `status_manual` flags a hand-set value so the indexer's
+/// `rebuild_projects` upsert knows never to overwrite it. Vocabulary is validated
+/// server-side (PROJECT_STATUSES in lib.rs): `active` | `labs` | `archived` |
+/// `inbox`. Archived projects are hidden from Launcher / Home / Digest by default.
+fn migrate_v5(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 5 {
+        return Ok(());
+    }
+    add_column_if_missing(conn, "projects", "status", "status TEXT")?;
+    add_column_if_missing(
+        conn,
+        "projects",
+        "status_manual",
+        "status_manual INTEGER DEFAULT 0",
+    )?;
+    conn.pragma_update(None, "user_version", 5)?;
+    Ok(())
+}
+
 /// SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS — check table_info first.
 fn add_column_if_missing(
     conn: &Connection,
@@ -348,6 +371,26 @@ pub fn load_blacklist_patterns(conn: &Connection) -> Vec<String> {
                 .map(|rows| rows.flatten().collect())
         })
         .unwrap_or_default()
+}
+
+/// Encoded dirs of projects currently hidden because they're archived. Mirrors
+/// `load_blacklist_patterns`: a one-shot read feeding the per-query post-filter
+/// at the three session-load sites. "Archived" = explicit override OR derived
+/// (last activity older than ARCHIVE_DAYS). Pre-v5 DBs (no `status` column)
+/// degrade to "nothing archived." See lib::archived_predicate.
+pub fn load_archived_project_dirs(conn: &Connection) -> std::collections::HashSet<String> {
+    conn.prepare(
+        "SELECT encoded_dir FROM projects
+         WHERE status = 'archived'
+            OR (status IS NULL AND status_manual = 0
+                AND last_modified IS NOT NULL
+                AND last_modified < datetime('now','-90 days'))",
+    )
+    .and_then(|mut s| {
+        s.query_map([], |r| r.get::<_, String>(0))
+            .map(|rows| rows.flatten().collect())
+    })
+    .unwrap_or_default()
 }
 
 /// Read a meta value (e.g. "last_full_scan_ts").
@@ -428,7 +471,7 @@ mod tests {
         // user_version bumped to the latest applied migration (v1 schema + v2 heal
         // + v3 blacklist skip-tally column + v4 digest tables).
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
 
         // Blacklist table exists and is seeded exactly once
         let patterns = load_blacklist_patterns(&conn);
@@ -474,7 +517,7 @@ mod tests {
         // leave every user-curated field intact.
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
 
         let (mtime, area, pct, kanban): (i64, Option<String>, Option<i64>, Option<String>) = conn
             .query_row(
@@ -503,7 +546,7 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
 
         // A session to hang a digest + thread off of (FK targets must exist).
         conn.execute(
@@ -555,7 +598,7 @@ mod tests {
         // Re-running migrate is a no-op: version holds, rows survive.
         migrate(&conn).unwrap();
         let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v2, 4);
+        assert_eq!(v2, 5);
         let n_digests: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_digests", [], |r| r.get(0))
             .unwrap();

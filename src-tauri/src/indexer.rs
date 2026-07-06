@@ -700,8 +700,12 @@ fn estimate_cost(conn: &Connection, model: &str, acc: &UsageAcc) -> f64 {
 }
 
 fn rebuild_projects(conn: &Connection, config: &ClaudeConfig) {
-    // Aggregate sessions → projects; layer config's last-cost/lines.
-    conn.execute("DELETE FROM projects", []).ok();
+    // Aggregate sessions → projects; layer config's last-cost/lines. Targeted
+    // upsert: rewrites ONLY derived columns (counts, display name, config-sourced
+    // cost/lines, last_modified), never the user-curated columns (pinned, status,
+    // status_manual). Mirrors the sessions upsert's "user fields survive a
+    // re-parse" contract — previously this did DELETE + INSERT-with-pinned-0,
+    // which silently wiped pin state (and would wipe status) on every reindex.
     let mut stmt = conn
         .prepare(
             "SELECT project_dir, cwd, COUNT(*), MAX(last_ts)
@@ -723,17 +727,27 @@ fn rebuild_projects(conn: &Connection, config: &ClaudeConfig) {
         .flatten()
         .collect();
     drop(stmt);
+    let mut live: Vec<String> = Vec::with_capacity(rows.len());
     for (encoded, cwd, count, last_mod) in rows {
+        live.push(encoded.clone());
         let cfg = config.projects.get(&cwd);
         let last_cost = cfg.and_then(|c| c.last_cost_usd);
         let lines_added = cfg.and_then(|c| c.last_lines_added);
         let lines_removed = cfg.and_then(|c| c.last_lines_removed);
         let display = cwd.split('/').next_back().unwrap_or(&cwd).to_string();
         conn.execute(
-            "INSERT OR REPLACE INTO projects
+            "INSERT INTO projects
              (encoded_dir, cwd, display_name, session_count, last_cost_usd,
               last_lines_added, last_lines_removed, last_modified, pinned)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, 0)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8, 0)
+             ON CONFLICT(encoded_dir) DO UPDATE SET
+               cwd=excluded.cwd,
+               display_name=excluded.display_name,
+               session_count=excluded.session_count,
+               last_cost_usd=excluded.last_cost_usd,
+               last_lines_added=excluded.last_lines_added,
+               last_lines_removed=excluded.last_lines_removed,
+               last_modified=excluded.last_modified",
             params![
                 encoded,
                 cwd,
@@ -747,6 +761,13 @@ fn rebuild_projects(conn: &Connection, config: &ClaudeConfig) {
         )
         .ok();
     }
+    // Prune projects whose sessions vanished from disk. Bulk-safe: a one-shot
+    // IN-list would need dynamic placeholders, so this per-row delete is simpler
+    // and runs against a few-dozen-row table.
+    let mut prune = conn
+        .prepare("DELETE FROM projects WHERE encoded_dir NOT IN (SELECT project_dir FROM sessions)")
+        .unwrap();
+    prune.execute([]).ok();
 }
 
 fn extract_message_text(v: &Value) -> Option<String> {
@@ -989,7 +1010,9 @@ mod tests {
                 last_lines_added   INTEGER,
                 last_lines_removed INTEGER,
                 last_modified      TEXT,
-                pinned             INTEGER DEFAULT 0
+                pinned             INTEGER DEFAULT 0,
+                status             TEXT,
+                status_manual      INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS pricing (
@@ -1155,5 +1178,79 @@ mod tests {
         assert!(res);
         let mc: i64 = conn.query_row("SELECT message_count FROM sessions WHERE id='s2'", [], |r| r.get(0)).unwrap();
         assert_eq!(mc, 1);
+    }
+
+    /// Regression: rebuild_projects must NOT wipe user-curated columns (pinned,
+    /// status, status_manual). The old implementation did DELETE + INSERT with
+    /// pinned hardcoded to 0, silently losing pin state on every reindex and
+    /// any status override. The upsert must rewrite only derived columns.
+    #[test]
+    fn rebuild_projects_preserves_pinned_and_status() {
+        let conn = setup_mem_db();
+        // Seed one session → one project row.
+        conn.execute(
+            "INSERT INTO sessions (id, project_dir, cwd, title, file_path, file_mtime)
+             VALUES ('s1','-Users-x-Projects-brain','/Users/x/Projects/brain','t','/p',1)",
+            [],
+        )
+        .unwrap();
+        let cfg = ClaudeConfig { projects: HashMap::new() };
+        rebuild_projects(&conn, &cfg);
+
+        // Hand-set the user-curated columns.
+        conn.execute(
+            "UPDATE projects SET pinned = 1, status = 'archived', status_manual = 1
+             WHERE encoded_dir = '-Users-x-Projects-brain'",
+            [],
+        )
+        .unwrap();
+
+        // A second rebuild simulates a reindex — derived cols refresh, user cols survive.
+        rebuild_projects(&conn, &cfg);
+
+        let (pinned, status, manual): (i64, Option<String>, i64) = conn
+            .query_row(
+                "SELECT pinned, status, status_manual FROM projects
+                 WHERE encoded_dir = '-Users-x-Projects-brain'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pinned, 1, "pinned must survive a reindex");
+        assert_eq!(status.as_deref(), Some("archived"), "status must survive a reindex");
+        assert_eq!(manual, 1, "status_manual must survive a reindex");
+
+        // Derived columns DO refresh: session_count tracks the sessions table.
+        let count: i64 = conn
+            .query_row(
+                "SELECT session_count FROM projects WHERE encoded_dir = '-Users-x-Projects-brain'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Pruning: a project whose sessions vanished from disk is removed. Stale
+    /// rows would otherwise linger forever (and confuse the sidebar).
+    #[test]
+    fn rebuild_projects_prunes_vanished_projects() {
+        let conn = setup_mem_db();
+        let cfg = ClaudeConfig { projects: HashMap::new() };
+        // Seed + build for one project, then delete its session and rebuild.
+        conn.execute(
+            "INSERT INTO sessions (id, project_dir, cwd, title, file_path, file_mtime)
+             VALUES ('s1','-old','/old','t','/p',1)",
+            [],
+        )
+        .unwrap();
+        rebuild_projects(&conn, &cfg);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+
+        conn.execute("DELETE FROM sessions WHERE id = 's1'", []).unwrap();
+        rebuild_projects(&conn, &cfg);
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "vanished project must be pruned");
     }
 }

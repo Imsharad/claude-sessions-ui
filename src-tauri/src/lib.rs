@@ -78,6 +78,11 @@ pub struct SessionCard {
     pub cost_usd: f64,
     pub cost_source: String, // 'config' | 'estimate' | 'mixed' | 'none'
     pub pinned: bool,
+    /// Lifecycle status of the project this session belongs to, derived from the
+    /// `projects` table (override-wins, else derived from last activity). One of
+    /// PROJECT_STATUSES. The frontend groups the sidebar by this; Archived
+    /// sessions are filtered out of Launcher/Home/Digest at the query sites.
+    pub project_status: Option<String>,
     // ─── Tag & triage (F3 populates, F2 renders, F4 places) ───
     // All nullable: absent = untagged, which the UI renders as clean absence.
     pub area_of_life: Option<String>,
@@ -247,6 +252,23 @@ pub struct BlacklistPreview {
     pub session_count: i64,
 }
 
+/// One row of the project ontology, for the sidebar's status-grouped view. This
+/// is the full project list INCLUDING archived ones (which list_sessions filters
+/// out of SessionCard), so the sidebar can surface and un-archive them. Status
+/// is derived override-wins (the same field SessionCard carries); lastTs feeds
+/// the >90d → archived derivation and the section sort.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectEntry {
+    pub encoded_dir: String,
+    pub cwd: String,
+    pub display_name: String,
+    pub session_count: i64,
+    pub pinned: bool,
+    pub last_ts: Option<String>,
+    pub status: Option<String>,
+}
+
 use claude::TagError;
 
 /// Controlled area-of-life vocabulary (the editable one-liner from the spec).
@@ -310,7 +332,8 @@ fn list_sessions(filter: Option<SessionFilter>) -> Result<Vec<SessionCard>, Stri
                 COALESCE(SUM(u.cost_usd),0),
                 p.pinned,
                 s.area_of_life, s.project_short_name, s.goal_completed, s.completion_pct,
-                s.tag_rationale, s.tagged_at, s.manual_fields, s.kanban_status, s.kanban_order
+                s.tag_rationale, s.tagged_at, s.manual_fields, s.kanban_status, s.kanban_order,
+                p.status, p.status_manual, p.last_modified
          FROM sessions s
          LEFT JOIN session_usage u ON u.session_id = s.id
          LEFT JOIN projects p ON p.encoded_dir = s.project_dir",
@@ -355,8 +378,11 @@ fn list_sessions(filter: Option<SessionFilter>) -> Result<Vec<SessionCard>, Stri
         .collect::<Result<_, _>>()?;
     // Defensive filter: drop blacklisted trees still lingering in the DB so a
     // just-added pattern takes effect this query cycle, no re-index needed.
+    // Archived projects are hidden from the Launcher list by default (the
+    // sidebar exposes a collapsed Archived section to re-enter them).
     let patterns = db::load_blacklist_patterns(&conn);
     out.retain(|c| !dir_blacklisted(&c.cwd, &c.project_dir, &patterns));
+    out.retain(|c| c.project_status.as_deref() != Some("archived"));
     Ok(out)
 }
 
@@ -392,6 +418,12 @@ fn map_session_card(r: &rusqlite::Row) -> rusqlite::Result<SessionCard> {
         manual_fields: parse_manual_fields(r.get(23)?),
         kanban_status: r.get(24)?,
         kanban_order: r.get(25)?,
+        project_status: derive_project_status(
+            r.get::<_, Option<String>>(26)?.as_deref(),
+            r.get::<_, i64>(27)? != 0,
+            r.get::<_, Option<String>>(28)?.as_deref(),
+        )
+        .map(|s| s.to_string()),
         // Derived at read time, and only in the detail command (which has the
         // recaps in hand). The list query leaves it None.
         next_action: None,
@@ -501,6 +533,52 @@ fn preview_blacklist_pattern(pattern: String) -> Result<BlacklistPreview, String
 fn list_blacklist() -> Result<Vec<BlacklistEntry>, String> {
     let conn = db::open().map_err(|e| e.to_string())?;
     blacklist_entries(&conn)
+}
+
+/// The full project list for the sidebar's status-grouped view. Includes
+/// archived projects (unlike list_sessions, which filters them out) so the
+/// sidebar can surface and un-archive them. Drops blacklisted trees, mirroring
+/// the dual cwd/encoded check the session loaders use.
+#[tauri::command]
+fn list_projects() -> Result<Vec<ProjectEntry>, String> {
+    let conn = db::open().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT encoded_dir, cwd, display_name, session_count, pinned, last_modified,
+                    status, status_manual
+             FROM projects",
+        )
+        .map_err(|e| e.to_string())?;
+    let patterns = db::load_blacklist_patterns(&conn);
+    let mut out: Vec<ProjectEntry> = stmt
+        .query_map([], |r| {
+            let status: Option<String> = r.get(6)?;
+            let manual: i64 = r.get::<_, i64>(7)?;
+            let last_ts: Option<String> = r.get(5)?;
+            Ok(ProjectEntry {
+                encoded_dir: r.get(0)?,
+                status: derive_project_status(status.as_deref(), manual != 0, last_ts.as_deref())
+                    .map(|s| s.to_string()),
+                cwd: r.get(1)?,
+                display_name: r.get(2)?,
+                session_count: r.get(3)?,
+                pinned: r.get::<_, i64>(4)? != 0,
+                last_ts,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter(|p| !dir_blacklisted(&p.cwd, &p.encoded_dir, &patterns))
+        .collect();
+    // Pinned first, then by last activity desc — stable for the section render.
+    out.sort_by(|a, b| {
+        match (a.pinned, b.pinned) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => (b.last_ts.as_deref().unwrap_or("")).cmp(a.last_ts.as_deref().unwrap_or("")),
+        }
+    });
+    Ok(out)
 }
 
 #[tauri::command]
@@ -625,7 +703,10 @@ fn get_session_detail(id: String) -> Result<SessionDetail, String> {
                         COALESCE((SELECT SUM(cost_usd) FROM session_usage u WHERE u.session_id=s.id),0),
                         COALESCE((SELECT pinned FROM projects p WHERE p.encoded_dir=s.project_dir),0),
                         s.area_of_life, s.project_short_name, s.goal_completed, s.completion_pct,
-                        s.tag_rationale, s.tagged_at, s.manual_fields, s.kanban_status, s.kanban_order
+                        s.tag_rationale, s.tagged_at, s.manual_fields, s.kanban_status, s.kanban_order,
+                        (SELECT status FROM projects p WHERE p.encoded_dir=s.project_dir),
+                        COALESCE((SELECT status_manual FROM projects p WHERE p.encoded_dir=s.project_dir),0),
+                        (SELECT last_modified FROM projects p WHERE p.encoded_dir=s.project_dir)
                  FROM sessions s WHERE s.id = ?1",
             )
             .map_err(|e| e.to_string())?;
@@ -1095,11 +1176,16 @@ fn digest(days: Option<i64>) -> Result<Vec<DigestDay>, String> {
         })
         .map_err(|e| e.to_string())?;
 
-    // Defensive filter: same dual check as the indexer / list_sessions.
+    // Defensive filter: same dual check as the indexer / list_sessions, plus
+    // archived projects hidden by default.
     let patterns = db::load_blacklist_patterns(&conn);
+    let archived = db::load_archived_project_dirs(&conn);
     let mut by_day: Vec<DigestDay> = Vec::new();
     for (day, project_dir, entry) in rows.flatten() {
         if dir_blacklisted(&entry.cwd, &project_dir, &patterns) {
+            continue;
+        }
+        if archived.contains(&project_dir) {
             continue;
         }
         if by_day.last().map(|d| d.day == day).unwrap_or(false) {
@@ -1695,6 +1781,53 @@ fn update_session_tags(
 /// The three board columns, in order. The canonical status strings.
 const KANBAN_COLUMNS: [&str; 3] = ["planned", "in_progress", "completed"];
 
+// ─── Project ontology (lifecycle status) ────────────────────────────────────
+// A per-project status (Active / Labs / Archived / Inbox), stored on the
+// `projects` table. Override-wins like kanban: an explicit hand-set status
+// (status_manual=1) beats the derived fallback (last activity >90d → archived,
+// else active). Inbox has no derivation — it is always an explicit choice.
+// Archived projects are hidden from Launcher / Home / Digest by default; the
+// sidebar surfaces all four sections. Set via set_project_status; the controlled
+// vocabulary is validated server-side, mirroring KANBAN_COLUMNS / set_kanban.
+
+/// The canonical project lifecycle statuses: (key, display label). Keys are
+/// stored; labels are for the UI. Inbox is never derived — only explicit.
+const PROJECT_STATUSES: [(&str, &str); 4] = [
+    ("active", "Active"),
+    ("labs", "Labs"),
+    ("archived", "Archived"),
+    ("inbox", "Inbox"),
+];
+
+/// Resolve a project's effective status key from its stored row. Override-wins:
+/// a manual status is returned verbatim (after vocab validation). Otherwise
+/// derive: no recorded activity → None (untagged), >90 days idle → archived,
+/// else active. Pure + unit-tested; the query sites call this through
+/// load_archived_project_dirs for the hidden-by-default filter.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn derive_project_status(
+    stored_status: Option<&str>,
+    status_manual: bool,
+    last_modified: Option<&str>,
+) -> Option<&'static str> {
+    if status_manual {
+        return stored_status.and_then(|s| {
+            PROJECT_STATUSES
+                .into_iter()
+                .find(|(k, _)| *k == s)
+                .map(|(k, _)| k)
+        });
+    }
+    let last = last_modified?; // no activity → no derivable status
+    let dt = chrono::DateTime::parse_from_rfc3339(last).ok()?;
+    let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
+    if age.num_days() > 90 {
+        Some("archived")
+    } else {
+        Some("active")
+    }
+}
+
 /// Derive a session's board column: override-wins, then the completion rule,
 /// then None for untagged (which keeps it off the board entirely).
 ///
@@ -1745,6 +1878,31 @@ fn set_kanban(id: String, status: Option<String>, order: Option<f64>) -> Result<
         params![status, order, id],
     )
     .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Set a project's lifecycle status override (None clears it, falling back to
+/// the derived rule). Validates against PROJECT_STATUSES. Writes both the
+/// `status` and the `status_manual` flag so the indexer's upsert knows never to
+/// overwrite a hand-set value. Mirrors set_kanban's shape.
+#[tauri::command]
+fn set_project_status(encoded_dir: String, status: Option<String>) -> Result<(), String> {
+    if let Some(s) = &status {
+        if !PROJECT_STATUSES.iter().any(|(k, _)| *k == s.as_str()) {
+            return Err(format!("invalid project status: {s}"));
+        }
+    }
+    let conn = db::open().map_err(|e| e.to_string())?;
+    let manual = if status.is_some() { 1 } else { 0 };
+    let changed = conn
+        .execute(
+            "UPDATE projects SET status = ?1, status_manual = ?2 WHERE encoded_dir = ?3",
+            params![status, manual, encoded_dir],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err(format!("unknown project: {encoded_dir}"));
+    }
     Ok(())
 }
 
@@ -2165,6 +2323,26 @@ mod tests {
         assert_eq!(m, vec!["completionPct".to_string(), "areaOfLife".to_string()]);
     }
 
+    #[test]
+    fn derive_project_status_override_wins_and_age_rule() {
+        // No activity → no derivable status.
+        assert_eq!(derive_project_status(None, false, None), None);
+        // Recent activity → active.
+        let recent = chrono::Utc::now().to_rfc3339();
+        assert_eq!(derive_project_status(None, false, Some(&recent)), Some("active"));
+        // >90 days idle → archived.
+        let old = (chrono::Utc::now() - chrono::Duration::days(120)).to_rfc3339();
+        assert_eq!(derive_project_status(None, false, Some(&old)), Some("archived"));
+        // Manual override wins over the age rule, and validates against the vocab.
+        assert_eq!(
+            derive_project_status(Some("inbox"), true, Some(&old)),
+            Some("inbox")
+        );
+        // Manual flag set but value missing/invalid → None (no silent fallback).
+        assert_eq!(derive_project_status(Some("bogus"), true, Some(&recent)), None);
+        assert_eq!(derive_project_status(None, true, Some(&recent)), None);
+    }
+
     /// End-to-end probe against the real indexed DB. Ignored by default
     /// (requires a populated ~/.claude-sessions-ui/index.sqlite). Run with:
     ///   cargo test --lib search_recaps_against_real_db -- --ignored --nocapture
@@ -2324,6 +2502,7 @@ pub fn run() {
             get_stats,
             resume_session,
             toggle_pin,
+            list_projects,
             get_pricing,
             set_pricing,
             list_blacklist,
@@ -2334,6 +2513,7 @@ pub fn run() {
             update_session_tags,
             backfill_tags,
             set_kanban,
+            set_project_status,
             get_timeline,
             digest_session,
             digest_pending,
@@ -2370,6 +2550,7 @@ mod serde_tests {
             cost_usd: 0.0,
             cost_source: "none".into(),
             pinned: false,
+            project_status: None,
             area_of_life: Some("Building".into()),
             project_short_name: Some("sessions-ui".into()),
             goal_completed: Some(true),

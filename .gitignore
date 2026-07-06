@@ -25,3 +25,8 @@ dist-ssr
 
 # QA verification screenshots (transient)
 .qa-shots/
+
+# QA screenshots render REAL indexed sessions (project names, goals, spend) —
+# personal data, never commit. Assertion logs (transcript.json) are DOM-state
+# only and stay tracked as fixtures.
+qa/screenshots/**/*.png

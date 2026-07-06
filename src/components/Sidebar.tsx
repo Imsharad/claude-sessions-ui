@@ -1,35 +1,34 @@
 /**
  * Left sidebar: project navigation.
  * - "All sessions" entry at top
- * - Pinned projects (star icon)
- * - All projects grouped, with session counts
+ * - Pinned projects (star icon) — a cross-status flag, rendered first
+ * - Projects grouped by lifecycle status (Active / Labs / Inbox / Archived)
  * - Search input that filters the main list
+ * - Hidden-projects (blacklist) panel at the bottom
  *
- * Selection drives the SessionList filter. Pinning persists via the
- * toggle_pin command (writes through to SQLite).
+ * The project list comes from `list_projects` (the FULL list, including
+ * archived — which list_sessions filters out of SessionCard), so the sidebar
+ * can surface and un-archive them. Right-click a project to set its status.
+ * Selection drives the SessionList filter. Pinning persists via toggle_pin.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { Search, Star, Folder, Hash, EyeOff, X, Plus } from "lucide-react";
-import type { SessionCard, BlacklistEntry, BlacklistPreview } from "../lib/ipc";
+import { Search, Star, Folder, Hash, EyeOff, X, Plus, ChevronRight } from "lucide-react";
+import type { SessionCard, BlacklistEntry, BlacklistPreview, ProjectEntry } from "../lib/ipc";
 import {
   togglePin,
   listBlacklist,
+  listProjects,
   addBlacklistPattern,
   removeBlacklistPattern,
   previewBlacklistPattern,
+  setProjectStatus,
+  PROJECT_STATUS_LABELS,
+  PROJECT_STATUS_ORDER,
+  type ProjectStatus,
 } from "../lib/ipc";
 import { shortCwd } from "../lib/format";
-
-interface ProjectGroup {
-  projectDir: string;
-  cwd: string;
-  display: string;
-  count: number;
-  pinned: boolean;
-  lastTs: string | null;
-}
 
 interface SidebarProps {
   sessions: SessionCard[];
@@ -52,7 +51,57 @@ export function Sidebar({
   onPinnedChange,
   onBlacklistChange,
 }: SidebarProps) {
-  const [showAll, setShowAll] = useState(false);
+  // Full project list (including archived, which SessionCard doesn't carry).
+  // Reload on the same triggers the session list does — pin/hide/status writes
+  // all route through refreshProjects so sections re-group in one round-trip.
+  const [projects, setProjects] = useState<ProjectEntry[]>([]);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set(["archived"]));
+  const [menu, setMenu] = useState<{ dir: string; x: number; y: number } | null>(null);
+
+  const refreshProjects = () =>
+    listProjects()
+      .then(setProjects)
+      .catch((e) => console.error("list_projects failed", e));
+
+  useEffect(() => {
+    refreshProjects();
+  }, []);
+
+  // Group by derived status. Pinned renders first as its own section (a
+  // cross-status flag), then the four status sections in canonical order.
+  const { pinned, sections } = useMemo(() => {
+    const pinnedList = projects.filter((p) => p.pinned);
+    const byStatus: Record<string, ProjectEntry[]> = {};
+    for (const s of PROJECT_STATUS_ORDER) byStatus[s] = [];
+    for (const p of projects) {
+      const key = p.status ?? "active"; // null status → active section
+      (byStatus[key] ?? byStatus.active).push(p);
+    }
+    return { pinned: pinnedList, sections: byStatus };
+  }, [projects]);
+
+  // Close the context menu on any click outside it, or on Escape.
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenu(null);
+    window.addEventListener("click", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [menu]);
+
+  const handleSetStatus = async (dir: string, status: ProjectStatus | null) => {
+    setMenu(null);
+    try {
+      await setProjectStatus(dir, status);
+      await Promise.all([refreshProjects(), onBlacklistChange()]);
+    } catch (e) {
+      console.error("set_project_status failed", e);
+    }
+  };
 
   // Hidden-projects (blacklist) manage panel. Loaded once so the count reads
   // from launch; mutators return the refreshed list in one round-trip.
@@ -121,11 +170,11 @@ export function Sidebar({
   // One-click hide from a project row: the row's own cwd is the pattern, so
   // no glob syntax is involved. Deselect first if the hidden project is the
   // active filter — otherwise the list would sit on an invisible project.
-  const handleHideProject = async (g: ProjectGroup) => {
+  const handleHideProject = async (p: ProjectEntry) => {
     try {
-      setBlacklist(await addBlacklistPattern(g.cwd));
+      setBlacklist(await addBlacklistPattern(p.cwd));
       setHiddenError(null);
-      if (selectedProject === g.projectDir) onSelectProject(null);
+      if (selectedProject === p.encodedDir) onSelectProject(null);
       onBlacklistChange();
     } catch (e) {
       setHiddenError(String(e));
@@ -146,33 +195,15 @@ export function Sidebar({
     }
   };
 
-  // ponytail: Drop useMemo, computing groups is fast enough for <1000 items
-  const map = new Map<string, ProjectGroup>();
-  for (const s of sessions) {
-    const existing = map.get(s.projectDir);
-    if (existing) {
-      existing.count += 1;
-      if (s.lastTs && (!existing.lastTs || s.lastTs > existing.lastTs)) existing.lastTs = s.lastTs;
-    } else {
-      map.set(s.projectDir, {
-        projectDir: s.projectDir,
-        cwd: s.cwd,
-        display: s.displayProject || s.cwd.split("/").pop() || s.cwd,
-        count: 1,
-        pinned: s.pinned,
-        lastTs: s.lastTs,
-      });
-    }
-  }
-  
-  const allGroups = [...map.values()].sort((a, b) => a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : (b.lastTs || "").localeCompare(a.lastTs || ""));
-  const pinned = allGroups.filter((g) => g.pinned);
-  const others = allGroups.filter((g) => !g.pinned);
-  const visibleOthers = showAll ? others : others.slice(0, 12);
-
+  // Pin toggle also refreshes the project list so it re-sections (a pinned
+  // archived project jumps to the Pinned section, etc.).
   const handlePin = async (dir: string) => {
-    try { await togglePin(dir); onPinnedChange(); }
-    catch (e) { console.error("pin failed", e); }
+    try {
+      await togglePin(dir);
+      await Promise.all([refreshProjects(), onPinnedChange()]);
+    } catch (e) {
+      console.error("pin failed", e);
+    }
   };
 
   return (
@@ -192,22 +223,104 @@ export function Sidebar({
       <nav className="flex-1 overflow-y-auto px-2 pb-4">
         <ProjectItem active={selectedProject === null} onClick={() => onSelectProject(null)} icon={<Hash size={14} />} label="All sessions" count={sessions.length} countStyle="muted" />
 
-        {pinned.length > 0 && <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">Pinned</div>}
-        {pinned.map((g) => (
-          <ProjectItem key={g.projectDir} active={selectedProject === g.projectDir} onClick={() => onSelectProject(g.projectDir)} icon={<Star size={14} className="fill-warn text-warn" />} label={g.display} sublabel={shortCwd(g.cwd)} count={g.count} onPin={() => handlePin(g.projectDir)} pinned onHide={() => handleHideProject(g)} />
+        {pinned.length > 0 && (
+          <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">Pinned</div>
+        )}
+        {pinned.map((p) => (
+          <ProjectItem
+            key={p.encodedDir}
+            active={selectedProject === p.encodedDir}
+            onClick={() => onSelectProject(p.encodedDir)}
+            onContextMenu={(e) => { e.preventDefault(); setMenu({ dir: p.encodedDir, x: e.clientX, y: e.clientY }); }}
+            icon={<Star size={14} className="fill-warn text-warn" />}
+            label={p.displayName}
+            sublabel={shortCwd(p.cwd)}
+            count={p.sessionCount}
+            onPin={() => handlePin(p.encodedDir)}
+            pinned
+            onHide={() => handleHideProject(p)}
+          />
         ))}
 
-        <div className="mt-4 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">Projects {others.length > 12 && !showAll && `(${others.length})`}</div>
-        {visibleOthers.map((g) => (
-          <ProjectItem key={g.projectDir} active={selectedProject === g.projectDir} onClick={() => onSelectProject(g.projectDir)} icon={<Folder size={14} className="text-ink-3" />} label={g.display} sublabel={shortCwd(g.cwd)} count={g.count} onPin={() => handlePin(g.projectDir)} onHide={() => handleHideProject(g)} />
-        ))}
-        {others.length > 12 && (
-          <button onClick={() => setShowAll((v) => !v)} className="mt-1 w-full rounded-sm px-3 py-1.5 text-left text-[12px] text-ink-3 transition hover:bg-surface-3 hover:text-ink-2">
-            {showAll ? "Show less" : `Show ${others.length - 12} more`}
-          </button>
-        )}
-        {others.length === 0 && pinned.length === 0 && <p className="px-3 py-2 text-[12px] text-ink-4">No projects indexed.</p>}
+        {PROJECT_STATUS_ORDER.map((statusKey) => {
+          const list = sections[statusKey] ?? [];
+          if (list.length === 0) return null;
+          const isCollapsed = collapsed.has(statusKey);
+          const toggle = () =>
+            setCollapsed((prev) => {
+              const next = new Set(prev);
+              if (next.has(statusKey)) next.delete(statusKey);
+              else next.add(statusKey);
+              return next;
+            });
+          return (
+            <div key={statusKey}>
+              <button
+                onClick={toggle}
+                className="mt-4 flex w-full items-center gap-1 px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4 hover:text-ink-3"
+              >
+                <ChevronRight size={10} className={isCollapsed ? "" : "rotate-90 transition-transform"} />
+                {PROJECT_STATUS_LABELS[statusKey]}
+                <span className="ml-auto font-normal text-ink-4 tabular-nums">{list.length}</span>
+              </button>
+              {!isCollapsed && list.map((p) => (
+                <ProjectItem
+                  key={p.encodedDir}
+                  active={selectedProject === p.encodedDir}
+                  onClick={() => onSelectProject(p.encodedDir)}
+                  onContextMenu={(e) => { e.preventDefault(); setMenu({ dir: p.encodedDir, x: e.clientX, y: e.clientY }); }}
+                  icon={<Folder size={14} className={statusKey === "archived" ? "text-ink-4" : "text-ink-3"} />}
+                  label={p.displayName}
+                  sublabel={shortCwd(p.cwd)}
+                  count={p.sessionCount}
+                  dimmed={statusKey === "archived"}
+                  onPin={() => handlePin(p.encodedDir)}
+                  onHide={() => handleHideProject(p)}
+                />
+              ))}
+            </div>
+          );
+        })}
+
+        {projects.length === 0 && <p className="px-3 py-2 text-[12px] text-ink-4">No projects indexed.</p>}
       </nav>
+
+      {/* Right-click context menu: set lifecycle status. Closes on any outside
+          click or Escape (listeners in the effect above). */}
+      {menu && (
+        <div
+          className="fixed z-50 min-w-[160px] rounded-lg border border-border bg-surface py-1 shadow-lg"
+          style={{ left: menu.x, top: menu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-ink-4">
+            Status
+          </div>
+          {PROJECT_STATUS_ORDER.map((s) => {
+            const current = projects.find((p) => p.encodedDir === menu.dir)?.status;
+            return (
+              <button
+                key={s}
+                onClick={() => handleSetStatus(menu.dir, s)}
+                className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] transition hover:bg-surface-2 ${
+                  current === s ? "text-accent-strong" : "text-ink-2"
+                }`}
+              >
+                <span className="w-3 text-center">{current === s ? "✓" : ""}</span>
+                {PROJECT_STATUS_LABELS[s]}
+              </button>
+            );
+          })}
+          <div className="my-1 border-t border-border" />
+          <button
+            onClick={() => handleSetStatus(menu.dir, null)}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] text-ink-3 transition hover:bg-surface-2"
+          >
+            <span className="w-3" />
+            Clear (auto)
+          </button>
+        </div>
+      )}
 
       <div className="border-t border-border px-2 pt-2 pb-3">
         <button
@@ -317,12 +430,14 @@ export function Sidebar({
 interface ProjectItemProps {
   active: boolean;
   onClick: () => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
   icon: React.ReactNode;
   label: string;
   sublabel?: string;
   count?: number;
   countStyle?: "default" | "muted";
   pinned?: boolean;
+  dimmed?: boolean;
   onPin?: () => void;
   onHide?: () => void;
 }
@@ -330,12 +445,14 @@ interface ProjectItemProps {
 function ProjectItem({
   active,
   onClick,
+  onContextMenu,
   icon,
   label,
   sublabel,
   count,
   countStyle = "default",
   pinned,
+  dimmed,
   onPin,
   onHide,
 }: ProjectItemProps) {
@@ -343,10 +460,13 @@ function ProjectItem({
   return (
     <div
       onClick={onClick}
+      onContextMenu={onContextMenu}
       className={`group relative flex cursor-pointer items-center gap-2 rounded-sm px-3 py-1.5 text-[13px] transition ${
         active
           ? "bg-accent-soft text-accent-strong"
-          : "text-ink-2 hover:bg-surface-3"
+          : dimmed
+            ? "text-ink-4 hover:bg-surface-3 hover:text-ink-3"
+            : "text-ink-2 hover:bg-surface-3"
       }`}
     >
       <span className={active ? "text-accent" : "text-ink-3"}>{icon}</span>

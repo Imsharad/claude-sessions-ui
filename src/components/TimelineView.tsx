@@ -66,11 +66,11 @@ const GAP_ROW_PX = 26;
 const BODY_CHROME_PX = 56; // body padding + threads/days separation
 const MIN_VISIBLE_DAYS = 3;
 
-// Sessions per project cluster before the tail collapses behind "show N more".
-// A 25-session / 4-project day then reads as four scannable clusters, not a
-// flat endless scroll of leaf rows — the same skeleton the L0 collapse gives
-// across days, one level down.
-const COLLAPSE_THRESHOLD = 5;
+// Sessions shown in a project cluster's preview. Clusters over this threshold
+// render the first N rows + "show N more"; expanding reveals the rest. A
+// 25-session / 4-project day reads as four scannable previews, not a flat
+// scroll — the same skeleton the L0 collapse gives across days, one level down.
+const COLLAPSE_THRESHOLD = 3;
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
@@ -101,9 +101,13 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
   // array index) so it survives window resizes and "Digest week" refreshes.
   const [expandedDays, setExpandedDays] = useState<Set<string>>(new Set());
   const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set());
-  // A cluster is in this set when the USER has toggled it expanded past the
-  // COLLAPSE_THRESHOLD cutoff. Absent = default (collapsed past threshold).
-  const [expandedClusters, setExpandedClusters] = useState<Set<string>>(new Set());
+  // Three-state cluster disclosure, keyed by `${date}:${project}`:
+  //   absent / 0 = collapsed (0 rows — header carries the count)
+  //   1          = preview (first COLLAPSE_THRESHOLD rows + "show N more")
+  //   2          = all rows
+  // Each toggle advances 0 → 1 → 2 → 0. Clusters at or under the threshold
+  // skip the preview stage — stage 0 already shows every row.
+  const [clusterStage, setClusterStage] = useState<Map<string, number>>(new Map());
   // "App activity" group (meta/harness sessions) — collapsed by default; only
   // expands on user action. Separate from day rows/totals (FIX 3).
   const [showAppActivity, setShowAppActivity] = useState(false);
@@ -197,12 +201,18 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
     });
   }, []);
 
-  const toggleCluster = useCallback((date: string, project: string) => {
+  const toggleCluster = useCallback((date: string, project: string, count: number) => {
     const key = `${date}:${project}`;
-    setExpandedClusters((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
+    // Small clusters skip the preview stage (a preview of 2-of-2 is pointless),
+    // so they cycle 0 → 2 → 0. Big clusters cycle 0 → 1 → 2 → 0.
+    setClusterStage((prev) => {
+      const next = new Map(prev);
+      const cur = next.get(key) ?? 0;
+      if (count > COLLAPSE_THRESHOLD) {
+        next.set(key, (cur + 1) % 3); // 0 → 1 → 2 → 0
+      } else {
+        next.set(key, cur === 0 ? 2 : 0); // 0 → 2 → 0 (skip preview)
+      }
       return next;
     });
   }, []);
@@ -676,21 +686,18 @@ export function TimelineView({ sessions, selectedId, onSelect }: TimelineViewPro
                             <div className="ml-[15px] space-y-1 border-l border-border py-1 pl-3">
                               {(() => {
                                 const clusters = clusterByProject(ids);
-                                // One project → no cluster header, just the rows.
-                                // The cluster spine is redundant when there's
-                                // nothing to disambiguate.
-                                if (clusters.length === 1) {
-                                  return clusters[0].ids.map((id) =>
-                                    renderSessionRow(id, false, false),
-                                  );
-                                }
+                                // Always render through ProjectCluster so every
+                                // group of sessions collapses the same way —
+                                // even a day with a single project gets a header
+                                // + the 3-state disclosure (consistency beats
+                                // saving one header row).
                                 return clusters.map(({ key, ids: cIds }) => (
                                   <ProjectCluster
                                     key={key}
                                     projectKey={key}
                                     ids={cIds}
-                                    expanded={expandedClusters.has(`${day.date}:${key}`)}
-                                    onToggle={() => toggleCluster(day.date, key)}
+                                    stage={clusterStage.get(`${day.date}:${key}`) ?? 0}
+                                    onToggle={() => toggleCluster(day.date, key, cIds.length)}
                                     renderRow={renderSessionRow}
                                   />
                                 ));
@@ -981,33 +988,38 @@ function SessionRow({
 function ProjectCluster({
   projectKey,
   ids,
-  expanded,
+  stage,
   onToggle,
   renderRow,
 }: {
   projectKey: string;
   ids: string[];
-  expanded: boolean;
+  /** 0 = collapsed (0 rows), 1 = preview (first N), 2 = all. The toggle cycle
+   *  is size-aware: small clusters (≤ threshold) skip stage 1 (a preview of 2
+   *  of 2 is pointless) and go 0 → 2 → 0, so EVERY cluster collapses at 0. */
+  stage: number;
   onToggle: () => void;
   renderRow: (id: string, inlineLoops: boolean, showProject?: boolean) => React.ReactNode;
 }) {
   const overThreshold = ids.length > COLLAPSE_THRESHOLD;
-  // Default-collapsed past threshold; the user-expand set inverts that.
-  const collapsed = overThreshold && !expanded;
-  const visible = collapsed ? ids.slice(0, COLLAPSE_THRESHOLD) : ids;
+  // Stage 0 is always collapsed. Small clusters at stage 0 still hide — they
+  // just expand straight to all (stage 2) on the first click, skipping preview.
+  const isOpen = stage > 0;
+  const inPreview = isOpen && stage < 2 && overThreshold;
+  const visible = !isOpen ? [] : inPreview ? ids.slice(0, COLLAPSE_THRESHOLD) : ids;
   const hiddenCount = ids.length - visible.length;
 
   return (
     <div>
       <button
         onClick={onToggle}
-        aria-expanded={!collapsed}
+        aria-expanded={isOpen}
         className="group/cluster flex min-h-[28px] w-full items-center gap-1.5 rounded-md px-1.5 py-1 text-left transition hover:bg-surface-2/60"
       >
         <ChevronRight
           size={11}
           aria-hidden
-          className={`shrink-0 text-ink-4 transition-transform ${collapsed ? "" : "rotate-90"}`}
+          className={`shrink-0 text-ink-4 transition-transform ${isOpen ? "rotate-90" : ""}`}
         />
         <span className="max-w-[180px] shrink-0 truncate text-[11.5px] font-semibold text-ink">
           {projectKey}
@@ -1016,25 +1028,27 @@ function ProjectCluster({
           {plural(ids.length, "session")}
         </span>
       </button>
-      <div className="ml-[7px] space-y-0.5 border-l border-border/70 py-0.5 pl-2.5">
-        {visible.map((id) => renderRow(id, false, false))}
-        {collapsed && hiddenCount > 0 && (
-          <button
-            onClick={onToggle}
-            className="ml-1 rounded-sm px-1.5 py-1 text-left text-[11px] text-ink-3 transition hover:bg-surface-2/60 hover:text-ink-2"
-          >
-            show {hiddenCount} more
-          </button>
-        )}
-        {!collapsed && overThreshold && (
-          <button
-            onClick={onToggle}
-            className="ml-1 rounded-sm px-1.5 py-1 text-left text-[11px] text-ink-3 transition hover:bg-surface-2/60 hover:text-ink-2"
-          >
-            show less
-          </button>
-        )}
-      </div>
+      {isOpen && (
+        <div className="ml-[7px] space-y-0.5 border-l border-border/70 py-0.5 pl-2.5">
+          {visible.map((id) => renderRow(id, false, false))}
+          {inPreview && hiddenCount > 0 && (
+            <button
+              onClick={onToggle}
+              className="ml-1 rounded-sm px-1.5 py-1 text-left text-[11px] text-ink-3 transition hover:bg-surface-2/60 hover:text-ink-2"
+            >
+              show {hiddenCount} more
+            </button>
+          )}
+          {!inPreview && overThreshold && (
+            <button
+              onClick={onToggle}
+              className="ml-1 rounded-sm px-1.5 py-1 text-left text-[11px] text-ink-3 transition hover:bg-surface-2/60 hover:text-ink-2"
+            >
+              show less
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -64,6 +64,10 @@ export interface SessionCard {
   costUsd: number;
   costSource: string;
   pinned: boolean;
+  /** Lifecycle status of this session's project, derived override-wins from the
+   *  `projects` table (active | labs | archived | inbox). Archived sessions are
+   *  filtered out of Launcher/Home/Digest by default; the sidebar groups by it. */
+  projectStatus: string | null;
   // Tag & triage (F3 populates, F2 renders, F4 places). Null = untagged.
   areaOfLife: string | null;
   projectShortName: string | null;
@@ -340,6 +344,24 @@ export const resumeSession = (id: string, fork = false): Promise<void> =>
 export const togglePin = (encodedDir: string): Promise<void> =>
   call<void>("toggle_pin", { encodedDir });
 
+/** One row of the full project list (incl. archived), for the sidebar's
+ *  status-grouped view. Mirrors ProjectEntry in lib.rs. */
+export interface ProjectEntry {
+  encodedDir: string;
+  cwd: string;
+  displayName: string;
+  sessionCount: number;
+  pinned: boolean;
+  lastTs: string | null;
+  status: string | null;
+}
+
+/** Full project list including archived (which list_sessions filters out), so
+ *  the sidebar can surface + un-archive them. Sorted: pinned first, then by
+ *  last activity desc. */
+export const listProjects = (): Promise<ProjectEntry[]> =>
+  call<ProjectEntry[]>("list_projects");
+
 export const getPricing = (): Promise<PricingRow[]> =>
   call<PricingRow[]>("get_pricing");
 
@@ -395,6 +417,30 @@ export const setKanban = (
   status: KanbanStatus | null,
   order: number | null,
 ): Promise<void> => call<void>("set_kanban", { id, status, order });
+
+// ─── Project ontology (lifecycle status) ─────────────────────────────
+// A per-project status (Active / Labs / Archived / Inbox). Set via the
+// sidebar (context menu on a project). Archived projects are hidden from
+// Launcher / Home / Digest by default; the sidebar groups all sessions by
+// status. Mirrors set_kanban's nullable-override shape; vocab validated
+// server-side against PROJECT_STATUSES in lib.rs.
+export type ProjectStatus = "active" | "labs" | "archived" | "inbox";
+
+/** Display labels for each status key (mirrors PROJECT_STATUSES in lib.rs). */
+export const PROJECT_STATUS_LABELS: Record<ProjectStatus, string> = {
+  active: "Active",
+  labs: "Labs",
+  archived: "Archived",
+  inbox: "Inbox",
+};
+
+/** Order used for sidebar section rendering (pinned first, then by this). */
+export const PROJECT_STATUS_ORDER: ProjectStatus[] = ["active", "labs", "inbox", "archived"];
+
+export const setProjectStatus = (
+  encodedDir: string,
+  status: ProjectStatus | null,
+): Promise<void> => call<void>("set_project_status", { encodedDir, status });
 
 // Timeline digest (P6). get_timeline is read-only and instant. digest_session
 // and digest_pending run the LLM behind the same TagError channel as tagging

@@ -633,7 +633,7 @@ mod tests {
         // Re-running migrate is a no-op: version holds, rows survive.
         migrate(&conn).unwrap();
         let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v2, 5);
+        assert_eq!(v2, 6);
         let n_digests: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_digests", [], |r| r.get(0))
             .unwrap();

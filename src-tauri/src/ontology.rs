@@ -25,12 +25,6 @@ pub struct ProjectIdentity {
     pub key: String,
 }
 
-/// `$HOME/Projects` — the ontology root. Returns None only if the home dir
-/// can't be resolved (degrades to the cwd-tail fallback everywhere).
-fn projects_root() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join("Projects"))
-}
-
 /// Split an absolute path into its `/`-separated segments, dropping empties.
 fn segments(path: &str) -> Vec<String> {
     path.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
@@ -43,24 +37,27 @@ fn is_known_hub(seg: &str) -> bool {
 
 /// The ontology-derived identity for a cwd. Collapse rule: inside
 /// `~/Projects/<x>/<name>/...`, `<name>` is the first segment after the hub-
-/// bearing position, so a worktree (`.../brain-feat`) and a subdir
-/// (`.../brain/src`) both collapse to the SAME `(hub, name)` as the canonical
-/// `.../brain`. Outside `~/Projects/` → `(None, tail)`.
+/// bearing position, so any subdir (`.../brain/src`, an in-repo worktree)
+/// collapses to the SAME `(hub, name)` as the canonical `.../brain`. A sibling
+/// worktree DIRECTORY (`.../brain-feat` next to `.../brain`) is its own name —
+/// collapsing those by suffix would merge genuinely distinct projects. Outside
+/// `~/Projects/` → `(None, tail)`.
 ///
-/// `home_override` exists for deterministic unit tests; production callers pass
-/// `None` (resolves via `dirs::home_dir()`).
+/// `home_override` is the HOME directory (not the Projects root) and exists for
+/// deterministic unit tests; production callers pass `None` (resolves via
+/// `dirs::home_dir()`, matching the override's semantics exactly).
 pub fn derive_identity_with(cwd: &str, home_override: Option<&str>) -> ProjectIdentity {
-    let home = match home_override.map(std::path::PathBuf::from).or_else(projects_root) {
+    let home = match home_override.map(std::path::PathBuf::from).or_else(dirs::home_dir) {
         Some(h) => h,
         None => return tail_identity(cwd),
     };
     let home_segs = segments(&home.to_string_lossy());
     let cwd_segs = segments(cwd);
 
-    // cwd must start with $HOME/Projects AND have at least two more segments
-    // (the hub and the project name) to qualify for ontology grouping.
+    // cwd must start with $HOME, then "Projects", then at least two more
+    // segments (the hub and the project name) to qualify for ontology grouping.
     let projects_idx = home_segs.len(); // index in cwd_segs where "Projects" sits
-    if cwd_segs.len() >= projects_idx + 2
+    if cwd_segs.len() >= projects_idx + 3
         && cwd_segs.get(projects_idx).map(|s| s.as_str()) == Some("Projects")
         && cwd_segs[..projects_idx] == home_segs
     {
@@ -107,17 +104,40 @@ mod tests {
     const HOME: &str = "/Users/test";
 
     #[test]
-    fn known_hub_collapses_worktree_and_subdir() {
-        // Canonical, a -feat worktree, and a subdir all collapse to NOW/brain.
+    fn known_hub_collapses_subdirs_not_siblings() {
+        // Canonical and any subdir (incl. in-repo worktrees) collapse to
+        // NOW/brain; a SIBLING directory is a distinct project by design —
+        // suffix-collapsing would merge genuinely different repos.
         let canon = derive_identity_with("/Users/test/Projects/NOW/brain", Some(HOME));
-        let worktree = derive_identity_with("/Users/test/Projects/NOW/brain-feat", Some(HOME));
         let subdir = derive_identity_with("/Users/test/Projects/NOW/brain/src", Some(HOME));
+        let deep = derive_identity_with("/Users/test/Projects/NOW/brain/wt/feat", Some(HOME));
+        let sibling = derive_identity_with("/Users/test/Projects/NOW/brain-feat", Some(HOME));
         assert_eq!(canon.key, "NOW/brain");
         assert_eq!(canon.hub.as_deref(), Some("NOW"));
         assert_eq!(canon.name, "brain");
-        // All three share the grouping key — one card, not three.
-        assert_eq!(canon.key, worktree.key, "worktree must collapse");
         assert_eq!(canon.key, subdir.key, "subdir must collapse");
+        assert_eq!(canon.key, deep.key, "nested path must collapse");
+        assert_ne!(canon.key, sibling.key, "sibling dir is its own project");
+    }
+
+    #[test]
+    fn hub_without_name_falls_back_without_panic() {
+        // ~/Projects/NOW alone (hub, no project) must not index out of bounds.
+        let id = derive_identity_with("/Users/test/Projects/NOW", Some(HOME));
+        assert_eq!(id.name, "NOW");
+        assert!(id.hub.is_none());
+    }
+
+    #[test]
+    fn production_home_semantics_match_override() {
+        // Regression: the None path must resolve HOME (not HOME/Projects) so
+        // real cwds under ~/Projects/<hub>/<name> actually group in production.
+        if let Some(home) = dirs::home_dir() {
+            let cwd = format!("{}/Projects/NOW/brain", home.to_string_lossy());
+            let id = derive_identity_with(&cwd, None);
+            assert_eq!(id.key, "NOW/brain");
+            assert_eq!(id.hub.as_deref(), Some("NOW"));
+        }
     }
 
     #[test]
@@ -142,11 +162,11 @@ mod tests {
 
     #[test]
     fn unknown_hub_still_groups_by_name_and_keeps_prefix() {
-        // An unrecognized hub segment: still grouped by the following name so
-        // worktrees collapse, but the hub shows in the prefix.
+        // An unrecognized hub segment: subdirs still collapse by the following
+        // name, and the hub shows in the display prefix.
         let a = derive_identity_with("/Users/test/Projects/experiments/widget", Some(HOME));
-        let b = derive_identity_with("/Users/test/Projects/experiments/widget-v2", Some(HOME));
-        assert_eq!(a.key, b.key, "unknown-hub worktrees must collapse by name");
+        let sub = derive_identity_with("/Users/test/Projects/experiments/widget/src", Some(HOME));
+        assert_eq!(a.key, sub.key, "unknown-hub subdirs must collapse by name");
         assert_eq!(a.hub.as_deref(), Some("experiments"));
         assert_eq!(a.name, "widget");
         // Unknown hub is NOT part of the key.

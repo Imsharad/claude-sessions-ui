@@ -213,6 +213,7 @@ struct ProjectWindow {
 }
 
 /// The digest fields the report prompt needs (a trimmed view of SessionDigest).
+#[derive(Clone)]
 struct SessionDigestLite {
     worked_on: String,
     outcome: String,
@@ -368,7 +369,6 @@ pub fn group_window_by_project(conn: &Connection, days: u32) -> Result<Vec<Proje
             .session_ids
             .iter()
             .filter_map(|sid| lites.get(sid).map(|d| (sid.clone(), d.clone())))
-            .map(|(sid, d)| (sid, d))
             .collect();
 
         // Arcs touching this project's digested sessions.
@@ -406,7 +406,8 @@ fn aggregate_files_touched(conn: &Connection, ids: &HashSet<String>) -> Result<i
         .collect();
     let n: i64 = conn
         .query_row(&sql, params.as_slice(), |r| r.get(0))
-        .optional()?
+        .optional()
+        .map_err(db_err)?
         .unwrap_or(0);
     Ok(n)
 }
@@ -426,7 +427,8 @@ fn aggregate_cost(conn: &Connection, ids: &HashSet<String>) -> Result<f64, TagEr
         .collect();
     let n: f64 = conn
         .query_row(&sql, params.as_slice(), |r| r.get(0))
-        .optional()?
+        .optional()
+        .map_err(db_err)?
         .unwrap_or(0.0);
     Ok(n)
 }
@@ -540,7 +542,7 @@ fn validate_report(
             let status = row
                 .get("status")
                 .and_then(|x| x.as_str())
-                .filter(|s| DVR_STATUSES.contains(&s.as_str()))
+                .filter(|s| DVR_STATUSES.contains(s))
                 .unwrap_or("open")
                 .to_string();
             if desired.is_empty() && real.is_empty() {
@@ -606,7 +608,7 @@ fn build_report_prompt(pw: &ProjectWindow) -> Result<String, TagError> {
         pw.arcs.iter().map(|a| format!("- {a}")).collect::<Vec<_>>().join("\n")
     };
 
-    format!(
+    Ok(format!(
         "You are writing a weekly project report card for the \"{name}\" project, summarizing \
 {cnt} digested session(s) in this window. Report ONLY what the session digests support — never \
 invent work, and never cite a session id that is not listed below.\n\n\
@@ -631,8 +633,7 @@ Return ONLY a strict JSON object, no prose and no markdown fences, with EXACTLY 
         cnt = pw.digests.len(),
         vocab = vocab,
         arcs = arcs,
-    )
-    .into()
+    ))
 }
 
 // ─── Persistence ─────────────────────────────────────────────────────────────

@@ -18,6 +18,8 @@ pub mod db;
 pub mod digest;
 pub mod home;
 pub mod indexer;
+pub mod ontology;
+pub mod report;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -1967,6 +1969,31 @@ fn update_session_digest(
     digest::update_digest(&conn, &id, worked_on, outcome, open_loops)
 }
 
+// ─── Review tab (project report cards) ───────────────────────────────────────
+// Two commands mirroring get_timeline / digest_pending. get_review is a
+// cache-first read (no LLM); generate_reports runs the report-card pass over
+// the window (and refreshes threads first so arcs are fresh), returning a
+// batch report like digest_pending. Same TagError channel as the digest pass.
+
+/// Read-only Review: grouped project cards for the window, cache-first. Projects
+/// with no stored report appear with null fields (the UI offers to generate).
+#[tauri::command]
+async fn get_review(days: u32) -> Result<report::ReviewResponse, TagError> {
+    tauri::async_runtime::spawn_blocking(move || report::get_review_blocking(days))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("get_review task failed to join: {e}")))?
+}
+
+/// Backfill report cards for the window: generate the missing/stale/hash-changed,
+/// bounded concurrency, never aborting on one failure. Projects with no digested
+/// sessions are a truthful skip (skipped_no_digest).
+#[tauri::command]
+async fn generate_reports(days: u32) -> Result<report::ReportBatchReport, TagError> {
+    tauri::async_runtime::spawn_blocking(move || report::generate_reports_blocking(days))
+        .await
+        .map_err(|e| TagError::new("cli_failed", format!("generate_reports task failed to join: {e}")))?
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 // Pure-logic probes for the ranker + snippet extractor. The DB-backed
 // search_recaps is exercised end-to-end via the running app; these cover the
@@ -2519,6 +2546,8 @@ pub fn run() {
             digest_pending,
             link_threads,
             update_session_digest,
+            get_review,
+            generate_reports,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

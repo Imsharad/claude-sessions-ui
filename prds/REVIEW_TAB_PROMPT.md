@@ -48,10 +48,12 @@ All of this exists in `src-tauri/src`:
 - `files_touched`, `session_usage` (cost/tokens), `errors`, `todos`.
 - `digest.rs` pipeline: `build_timeline`, `digest_pending_blocking`,
   `link_threads` — the report-card pass is a fourth sibling pass, same shape.
-- Project identity today is only `project_tail(cwd)` (last path segment,
-  `digest.rs`). There is **no ontology code in the codebase** — the
-  `review-ontology.html` mockup is an unmerged proposal. The ontology
-  derivation below is NEW scope this feature lands.
+- Project identity: `src-tauri/src/ontology.rs` (landed with this feature)
+  derives `(hub, name)` from cwd. Separately, PR #6 landed project LIFECYCLE
+  status (`projects.status` / `status_manual`, `derive_project_status`,
+  archived filtering, `list_projects` / `set_project_status`) — an orthogonal
+  concern Review must CONSUME: archived projects stay off the Review shelf
+  unless the user opts in.
 
 ## Backend deliverable
 
@@ -139,10 +141,9 @@ widget, it failed.
 
 No cross-project synthesis paragraph, no charts (Analytics owns numbers), no
 date-range picker beyond the three presets, no editing of Built/How/Why
-bullets in-app beyond the headline, no export. No project lifecycle status
-(`projects.status` columns, archived filtering, Home/Launcher/Timeline
-changes) — that is the separate unmerged Project Ontology Phase 1 diff; this
-feature only lands the identity parser it needs.
+bullets in-app beyond the headline, no export. Lifecycle status is no longer
+a non-goal to BUILD (PR #6 landed it) but Review does not EDIT status — it
+only reads it to filter archived projects off the shelf.
 
 ## Acceptance
 

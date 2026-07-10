@@ -639,7 +639,7 @@ mod tests {
             .unwrap();
         assert_eq!(n_digests, 1, "idempotent migrate must not drop rows");
 
-        // v5: project_reports table landed (one row round-trips).
+        // v6: project_reports table landed (one row round-trips).
         conn.execute(
             "INSERT INTO project_reports (project_key, window_days, window_end, content_hash, prompt_version, headline)
              VALUES ('NOW/brain', 7, '2026-07-08', 'deadbeef', 1, 'calm headline')",

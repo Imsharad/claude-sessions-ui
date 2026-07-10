@@ -1,5 +1,5 @@
 /**
- * Top bar: app title, view switcher (Launcher / Analytics / Digest), global
+ * Top bar: app title, view switcher (Launcher / Analytics / Review), global
  * stats summary, and reindex action. Drag region for the window (Tauri native
  * feel — the bar moves the window on macOS).
  */
@@ -7,7 +7,7 @@ import { RefreshCw, Loader2, Layers, BarChart3, BookOpen, List, LayoutGrid, Keyb
 import type { IndexStatus, GlobalStats } from "../lib/ipc";
 import { formatTokens, formatCost } from "../lib/format";
 
-export type View = "home" | "launcher" | "timeline" | "analytics" | "digest";
+export type View = "home" | "launcher" | "timeline" | "analytics" | "review";
 export type LauncherMode = "list" | "board" | "triage";
 
 interface Props {
@@ -27,7 +27,7 @@ export function TopBar({ view, onViewChange, launcherMode, onLauncherModeChange,
     { id: "launcher", label: "Launcher", icon: <Layers size={12} /> },
     { id: "timeline", label: "Timeline", icon: <Calendar size={12} /> },
     { id: "analytics", label: "Analytics", icon: <BarChart3 size={12} /> },
-    { id: "digest", label: "Digest", icon: <BookOpen size={12} /> },
+    { id: "review", label: "Review", icon: <BookOpen size={12} /> },
   ];
   const modes: { id: LauncherMode; label: string; icon: React.ReactNode }[] = [
     { id: "list", label: "List view", icon: <List size={12} /> },

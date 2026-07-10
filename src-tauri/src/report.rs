@@ -116,24 +116,11 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Last path segment of a cwd (kept for parity with digest's project_tail).
-fn project_tail(cwd: &str) -> String {
-    cwd.split('/').next_back().unwrap_or(cwd).to_string()
-}
-
 /// Parse a JSON array-of-strings column into a Vec; null/invalid → empty.
 fn parse_str_array(raw: Option<String>) -> Vec<String> {
     raw.as_deref()
         .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
         .unwrap_or_default()
-}
-
-/// Add a field name to a manual_fields list, deduped.
-fn add_manual(mut manual: Vec<String>, field: &str) -> Vec<String> {
-    if !manual.iter().any(|m| m == field) {
-        manual.push(field.to_string());
-    }
-    manual
 }
 
 /// FNV-1a 64-bit. Stable across process restarts, so the content_hash cache
@@ -197,7 +184,7 @@ fn extract_json_object(text: &str) -> Result<serde_json::Value, TagError> {
 // ─── Grouping (deterministic Rust, no LLM) ───────────────────────────────────
 
 /// One project's collected window data, the input to report generation.
-struct ProjectWindow {
+pub(crate) struct ProjectWindow {
     identity: ProjectIdentity,
     /// Newest-first session ids in the window for this project (all of them,
     /// including un-digested ones, which are counted but excluded from prose).
@@ -306,11 +293,14 @@ fn load_all_threads(conn: &Connection) -> Vec<(String, Vec<String>)> {
     order.into_iter().filter_map(|id| map.remove(&id)).collect()
 }
 
-/// Group the window's sessions by ontology identity. Blacklist-filtered.
-/// Sessions without a digest are counted (per project) but excluded from prose.
-pub fn group_window_by_project(conn: &Connection, days: u32) -> Result<Vec<ProjectWindow>, TagError> {
+/// Group the window's sessions by ontology identity. Blacklist-filtered, and
+/// archived projects are hidden by default (same post-filter as Home / Digest /
+/// Launcher). Sessions without a digest are counted (per project) but excluded
+/// from prose.
+pub(crate) fn group_window_by_project(conn: &Connection, days: u32) -> Result<Vec<ProjectWindow>, TagError> {
     let (_, oldest) = window_bounds(days);
     let patterns = crate::db::load_blacklist_patterns(conn);
+    let archived = crate::db::load_archived_project_dirs(conn);
 
     // Sessions in the window, newest-first. Carry first_ts for sort stability.
     let mut stmt = conn
@@ -335,6 +325,9 @@ pub fn group_window_by_project(conn: &Connection, days: u32) -> Result<Vec<Proje
     let mut by_key: HashMap<String, ProjectWindow> = HashMap::new();
     for (id, cwd, pd, _ts) in rows {
         if dir_blacklisted(&cwd, &pd, &patterns) {
+            continue;
+        }
+        if archived.contains(&pd) {
             continue;
         }
         let identity = crate::ontology::derive_identity(&cwd);
@@ -642,6 +635,9 @@ Return ONLY a strict JSON object, no prose and no markdown fences, with EXACTLY 
 struct StoredReport {
     content_hash: String,
     prompt_version: i64,
+    /// Read for column-index alignment; not surfaced (the wire type derives model
+    /// from REPORT_MODEL, same convention as the digest pass).
+    #[allow(dead_code)]
     model: Option<String>,
     headline: Option<String>,
     built: Vec<(String, Vec<String>)>,
@@ -860,7 +856,7 @@ fn generate_text(prompt: &str, max_tokens: u32, allow_cli: bool) -> Result<Strin
 
 /// Whether a report completion actually ran (Generated) or the cache answered
 /// (Cached) — lets the batch report split the two.
-pub enum ReportOutcome {
+pub(crate) enum ReportOutcome {
     Generated,
     Cached,
 }
@@ -868,7 +864,7 @@ pub enum ReportOutcome {
 /// Generate-or-return-cached for one project. Cache hit when a stored row's
 /// content_hash matches the current input (and its prompt_version is current).
 /// No digested sessions → typed "no_digest" (a truthful skip).
-pub fn generate_or_cache(
+pub(crate) fn generate_or_cache(
     conn: &Connection,
     pw: &ProjectWindow,
     window_days: u32,
@@ -1169,18 +1165,5 @@ mod tests {
         // Empty built.
         let no_built = serde_json::json!({ "headline": "h", "built": [] });
         assert_eq!(validate_report(&no_built, &known).unwrap_err().kind, "invalid_json");
-    }
-
-    #[test]
-    fn add_manual_dedups() {
-        let m = add_manual(vec![], "headline");
-        let m = add_manual(m, "headline");
-        assert_eq!(m, vec!["headline".to_string()]);
-    }
-
-    #[test]
-    fn project_tail_mirrors_digest() {
-        assert_eq!(project_tail("/a/b/brain"), "brain");
-        assert_eq!(project_tail("brain"), "brain");
     }
 }

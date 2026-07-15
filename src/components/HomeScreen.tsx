@@ -12,7 +12,7 @@
  * The why-sentence and open todos arrive pre-templated from the backend and are
  * rendered verbatim — no free text assembled here.
  */
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import { GitBranch, Clock, Square, Play, Search } from "lucide-react";
 import type { HomeData, HomeThread } from "../lib/ipc";
@@ -82,6 +82,7 @@ function ResumeButton({
         >
           <Play size={16} className="fill-white" />
           Resume
+          <span className="ml-1 text-[11px] font-medium text-white/70">Ret</span>
         </button>
         <button
           type="button"
@@ -109,11 +110,21 @@ function ResumeButton({
 }
 
 /** Slot 1 — the HERO. The single most likely "resume this" answer, shown in full:
- *  name + area + branch, a 4-line recap, the Left-off todo block, the why, and
- *  the largest Resume target on screen. In stale mode the todo block is prefixed
- *  "When you left:". Hero is not a browse target — it IS the detail. */
+ *  name + area + branch, digest-first body (worked_on/outcome), open loops,
+ *  mechanical todos, why, and the largest Resume target. In stale mode the todo
+ *  block is prefixed "When you left:" when no loops are present. */
 function Hero({ thread, stale }: { thread: HomeThread; stale: boolean }) {
-  const recap = thread.latestRecap || thread.latestTitle;
+  const openLoops = (thread.openLoops ?? []).slice(0, 3);
+  const openTodos = thread.openTodos ?? [];
+
+  let body = thread.latestRecap || thread.latestTitle;
+  if (thread.workedOn || thread.outcome) {
+    const parts: string[] = [];
+    if (thread.workedOn) parts.push(thread.workedOn);
+    if (thread.outcome) parts.push(thread.outcome);
+    body = `Left off: ${parts.join(" ")}`;
+  }
+
   return (
     <motion.section
       initial={{ opacity: 0, y: 8 }}
@@ -134,22 +145,48 @@ function Hero({ thread, stale }: { thread: HomeThread; stale: boolean }) {
         </span>
       </div>
 
-      {/* Recap — clamped to 4 lines, not a headline */}
+      {/* Body — digest worked_on/outcome first, else recap, else title */}
       <p className="mt-4 max-w-[68ch] text-[14px] leading-relaxed text-ink-2 line-clamp-4">
-        {recap}
+        {body}
       </p>
 
-      {/* Left off — up to 3 open todos, non-interactive checkbox bullets. Empty
-          renders nothing. Stale mode prefixes the memory-jog framing. */}
-      {thread.openTodos.length > 0 && (
+      {/* Open loops — stated unfinished intent from digests (max 3) */}
+      {openLoops.length > 0 && (
         <div className="mt-5">
           <div className="text-[11px] font-medium uppercase tracking-wide text-ink-3">
-            {stale ? "When you left:" : "Left off"}
+            Open loops
           </div>
           <ul className="mt-2 space-y-1.5">
-            {thread.openTodos.map((todo, i) => (
+            {openLoops.map((loop, i) => (
               <li key={i} className="flex items-start gap-2 text-[13px] text-ink-2">
-                <Square size={14} className="mt-[3px] shrink-0 text-ink-4" />
+                <span className="mt-[1px] shrink-0 text-ink-3">-</span>
+                <span className="leading-snug">{loop}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Mechanical todos — quieter label when open loops already shown */}
+      {openTodos.length > 0 && (
+        <div className={openLoops.length > 0 ? "mt-4" : "mt-5"}>
+          <div
+            className={
+              openLoops.length > 0
+                ? "text-[10px] font-medium uppercase tracking-wide text-ink-3"
+                : "text-[11px] font-medium uppercase tracking-wide text-ink-3"
+            }
+          >
+            {openLoops.length > 0
+              ? "Todos"
+              : stale
+                ? "When you left:"
+                : "Left off"}
+          </div>
+          <ul className="mt-2 space-y-1.5">
+            {openTodos.map((todo, i) => (
+              <li key={i} className="flex items-start gap-2 text-[13px] text-ink-2">
+                <Square size={14} className="mt-[3px] shrink-0 text-ink-3" />
                 <span className="leading-snug">{todo}</span>
               </li>
             ))}
@@ -266,6 +303,42 @@ function ExitRow({
 
 export function HomeScreen({ data, onBrowse }: Props) {
   const { threads, totalSessions, activeThreadsThisWeek, stale, lastActivityTs } = data;
+  const resumingRef = useRef(false);
+
+  // Enter resumes hero; 2/3 resume secondary slots. Ignore typing surfaces.
+  useEffect(() => {
+    const onKey = async (e: KeyboardEvent) => {
+      const active = document.activeElement as HTMLElement | null;
+      if (
+        active &&
+        (active.tagName === "INPUT" ||
+          active.tagName === "TEXTAREA" ||
+          active.isContentEditable)
+      ) {
+        return;
+      }
+
+      let target: HomeThread | undefined;
+      if (e.key === "Enter") target = threads[0];
+      else if (e.key === "2") target = threads[1];
+      else if (e.key === "3") target = threads[2];
+      else return;
+
+      if (!target || resumingRef.current) return;
+      e.preventDefault();
+      resumingRef.current = true;
+      try {
+        await resumeSession(target.latestSessionId, false);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        resumingRef.current = false;
+      }
+    };
+
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [threads]);
 
   // Zero sessions: a single hero-sized card, no slots, no exit row.
   if (totalSessions === 0 || threads.length === 0) {

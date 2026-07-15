@@ -548,6 +548,10 @@ export interface HomeThread {
   latestTitle: string;
   latestRecap: string | null;
   openTodos: string[]; // up to 3, already filtered to status != completed
+  /** Digest open loops (stated unfinished intent). Optional until backend L-term ships. */
+  openLoops?: string[];
+  workedOn?: string | null;
+  outcome?: string | null;
   completionPct: number | null;
   whySentence: string; // pre-templated by backend, render verbatim
   score: number;

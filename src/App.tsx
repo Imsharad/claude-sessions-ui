@@ -4,7 +4,7 @@
  * behind a loading screen. Subsequent launches do an incremental scan in the
  * background.
  *
- * View switching: Launcher (P2, this file), Analytics (P5, stub), Digest (P4).
+ * View switching: Launcher (P2, this file), Analytics (P5, stub), Review (P4).
  */
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
@@ -15,6 +15,7 @@ import { KanbanBoard, columnOf } from "./components/KanbanBoard";
 import { SessionDetail } from "./components/SessionDetail";
 import { TriageMode } from "./components/TriageMode";
 import { TimelineView } from "./components/TimelineView";
+import { ReviewView } from "./components/ReviewView";
 import { HomeScreen } from "./components/HomeScreen";
 import { FirstRun } from "./components/FirstRun";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -128,6 +129,16 @@ export default function App() {
   // Same overlay-dismiss for the timeline's detail (it stays mounted beneath).
   useEffect(() => {
     if (view !== "timeline" || !selectedSession) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSelectedSession(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [view, selectedSession]);
+
+  // Same overlay-dismiss for the Review tab's evidence detail (Tier 2).
+  useEffect(() => {
+    if (view !== "review" || !selectedSession) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setSelectedSession(null);
     };
@@ -252,7 +263,36 @@ export default function App() {
         )}
 
         {view === "analytics" && <ComingSoon title="Analytics" />}
-        {view === "digest" && <ComingSoon title="Digest" />}
+
+        {view === "review" && (
+          // Review is a full reading surface; clicking an evidence chip (Tier 2)
+          // opens the existing SessionDetail as a right-anchored overlay (same
+          // idiom as the timeline — the review stays mounted, scroll survives).
+          <div className="relative flex min-h-0 flex-1">
+            <ReviewView
+              sessions={sessions}
+              selectedId={selectedSession}
+              onSelect={setSelectedSession}
+            />
+            <AnimatePresence>
+              {selectedSession && (
+                <motion.aside
+                  key="review-detail"
+                  initial={{ x: "100%" }}
+                  animate={{ x: 0 }}
+                  exit={{ x: "100%" }}
+                  transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                  className="absolute inset-y-0 right-0 z-20 flex w-[420px] flex-col overflow-hidden rounded-l-lg border-l border-border bg-surface shadow-lg"
+                >
+                  <SessionDetail
+                    sessionId={selectedSession}
+                    onClose={() => setSelectedSession(null)}
+                  />
+                </motion.aside>
+              )}
+            </AnimatePresence>
+          </div>
+        )}
       </div>
     </ErrorBoundary>
   );

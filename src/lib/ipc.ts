@@ -461,6 +461,73 @@ export const linkThreads = (days = 7): Promise<Thread[]> =>
 export const updateSessionDigest = (id: string, patch: DigestPatch): Promise<SessionDigest> =>
   call<SessionDigest>("update_session_digest", { id, ...patch });
 
+// ─── Review tab (project report cards) ─────────────────────────────────
+// Per-project report card for a window (7/14/30d): what was built / how / why,
+// where every "built" claim cites real session evidence (validated in Rust).
+// get_review is a cache-first read (no LLM); generate_reports runs the
+// report-card pass (and refreshes threads first). Same TagError channel as the
+// digest pass — "no_digest" is a truthful skip for a project with no digests.
+
+/** A "what was built" claim with its evidence session ids. */
+export interface BuiltClaim {
+  claim: string;
+  evidence: string[];
+}
+
+export type DvrStatus = "landed" | "partial" | "open";
+
+/** One row of the desired-vs-real reconciliation. */
+export interface DesiredVsRealRow {
+  desired: string;
+  real: string;
+  status: DvrStatus;
+}
+
+/** One project's report card for a window. `headline` is null when no report
+ *  has been generated yet (the UI offers to generate). `notDigestedCount` is
+ *  shown honestly on the card. `stale` flags a source set that changed after
+ *  generation; `manualFields` lists hand-edited fields (headline only in v1). */
+export interface ProjectReport {
+  projectKey: string;
+  hub: string | null;
+  name: string;
+  headline: string | null;
+  built: BuiltClaim[];
+  how: string[];
+  why: string[];
+  desiredVsReal: DesiredVsRealRow[];
+  windowDays: number;
+  windowEnd: string;
+  sessionIds: string[];
+  notDigestedCount: number;
+  filesTouched: number;
+  costUsd: number;
+  stale: boolean;
+  manualFields: string[];
+  generatedAt: string | null;
+}
+
+/** Everything the Review view needs in one round-trip. Sorted by recency. */
+export interface ReviewResponse {
+  windowDays: number;
+  windowEnd: string;
+  cards: ProjectReport[];
+}
+
+/** Result of a batch report generation over the window. */
+export interface ReportBatchReport {
+  generated: number;
+  cached: number;
+  failed: number;
+  skippedNoDigest: number;
+}
+
+export const getReview = (days = 7): Promise<ReviewResponse> =>
+  call<ReviewResponse>("get_review", { days });
+
+export const generateReports = (days = 7): Promise<ReportBatchReport> =>
+  call<ReportBatchReport>("generate_reports", { days });
+
 // ─── Home screen (first screen) ────────────────────────────────────────
 // list_threads clusters sessions into ranked threads (project / project·branch)
 // and returns the top `limit` plus the orientation counts. Computed at query
@@ -481,6 +548,10 @@ export interface HomeThread {
   latestTitle: string;
   latestRecap: string | null;
   openTodos: string[]; // up to 3, already filtered to status != completed
+  /** Digest open loops (stated unfinished intent). Optional until backend L-term ships. */
+  openLoops?: string[];
+  workedOn?: string | null;
+  outcome?: string | null;
   completionPct: number | null;
   whySentence: string; // pre-templated by backend, render verbatim
   score: number;

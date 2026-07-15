@@ -152,6 +152,7 @@ pub(crate) fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     migrate_v3(conn)?;
     migrate_v4(conn)?;
     migrate_v5(conn)?;
+    migrate_v6(conn)?;
     Ok(())
 }
 
@@ -316,6 +317,40 @@ fn migrate_v5(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// v6: Review tab — one project report card per (project_key, window_days,
+/// window_end). LLM output is untrusted: schema-validated + referentially
+/// checked in Rust before it lands here. content_hash (FNV-1a over the input
+/// digest hashes + prompt_version + model) gates regeneration so an unchanged
+/// week never regenerates; manual_fields protects a hand-edited headline.
+fn migrate_v6(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 6 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS project_reports (
+            project_key     TEXT NOT NULL,        -- ontology key, e.g. "NOW/brain"
+            window_days     INTEGER NOT NULL,     -- 7 | 14 | 30
+            window_end      TEXT NOT NULL,        -- YYYY-MM-DD (local today)
+            content_hash    TEXT NOT NULL,        -- FNV-1a over input digest hashes + prompt_version + model
+            prompt_version  INTEGER NOT NULL,
+            model           TEXT,
+            headline        TEXT,                 -- one calm sentence, ≤120 chars
+            built           TEXT,                 -- JSON: [{claim, evidence:[sessionId,...]}]
+            how             TEXT,                 -- JSON: [string]
+            why             TEXT,                 -- JSON: [string]
+            desired_vs_real TEXT,                 -- JSON: [{desired, real, status}]
+            manual_fields   TEXT,                 -- JSON array of hand-edited field names
+            generated_at    TEXT,
+            PRIMARY KEY (project_key, window_days, window_end)
+        );
+        "#,
+    )?;
+    conn.pragma_update(None, "user_version", 6)?;
+    Ok(())
+}
+
 /// SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS — check table_info first.
 fn add_column_if_missing(
     conn: &Connection,
@@ -469,9 +504,9 @@ mod tests {
         migrate(&conn).unwrap();
 
         // user_version bumped to the latest applied migration (v1 schema + v2 heal
-        // + v3 blacklist skip-tally column + v4 digest tables).
+        // + v3 blacklist skip-tally column + v4 digest tables + v5 project status + v6 project_reports).
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
 
         // Blacklist table exists and is seeded exactly once
         let patterns = load_blacklist_patterns(&conn);
@@ -517,7 +552,7 @@ mod tests {
         // leave every user-curated field intact.
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
 
         let (mtime, area, pct, kanban): (i64, Option<String>, Option<i64>, Option<String>) = conn
             .query_row(
@@ -546,7 +581,7 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
 
         // A session to hang a digest + thread off of (FK targets must exist).
         conn.execute(
@@ -598,10 +633,26 @@ mod tests {
         // Re-running migrate is a no-op: version holds, rows survive.
         migrate(&conn).unwrap();
         let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v2, 5);
+        assert_eq!(v2, 6);
         let n_digests: i64 = conn
             .query_row("SELECT COUNT(*) FROM session_digests", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n_digests, 1, "idempotent migrate must not drop rows");
+
+        // v6: project_reports table landed (one row round-trips).
+        conn.execute(
+            "INSERT INTO project_reports (project_key, window_days, window_end, content_hash, prompt_version, headline)
+             VALUES ('NOW/brain', 7, '2026-07-08', 'deadbeef', 1, 'calm headline')",
+            [],
+        )
+        .unwrap();
+        let headline: String = conn
+            .query_row(
+                "SELECT headline FROM project_reports WHERE project_key='NOW/brain' AND window_days=7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(headline, "calm headline");
     }
 }

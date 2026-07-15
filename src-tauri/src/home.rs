@@ -13,9 +13,10 @@
 //!      project case-insensitively; otherwise the tag wins for tagged rows.
 //!   2. Branch split: a non-modal branch with >=2 sessions in the last 14 days
 //!      splits into a `{key} · {branch}` sub-thread.
-//!   Scoring: score = S * (100R + 40D + 30U + 15P). Dominance guard caps a
-//!   project at 2 slots. If every thread is a tiny one-off (all S=0) the guard
-//!   relaxes and everything ranks by recency alone.
+//!   Scoring: score = S * (100R + 40D + 30U + 15P + 25L). L is open-loop
+//!   pressure from digest open_loops (+ open desired_vs_real). Dominance guard
+//!   caps a project at 2 slots. If every thread is a tiny one-off (all S=0) the
+//!   guard relaxes and everything ranks by recency alone.
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,12 @@ pub struct HomeThread {
     pub latest_title: String,
     pub latest_recap: Option<String>,
     pub open_todos: Vec<String>,
+    /// Stated unfinished intent (digest open_loops + open desired_vs_real), max 3.
+    pub open_loops: Vec<String>,
+    /// Digest worked_on for the latest session, when present.
+    pub worked_on: Option<String>,
+    /// Digest outcome for the latest session, when present.
+    pub outcome: Option<String>,
     pub completion_pct: Option<i64>,
     pub why_sentence: String,
     pub score: f64,
@@ -77,6 +84,14 @@ pub struct SessionRow {
     completion_pct: Option<i64>,
     kanban_status: Option<String>,
     open_todo_count: i64,
+    /// Digest open_loops for this session (empty if no digest row).
+    digest_open_loops: Vec<String>,
+    digest_worked_on: Option<String>,
+    digest_outcome: Option<String>,
+    /// Open desired_vs_real "desired" strings from the newest report for this
+    /// session's ontology project key (project-level, same on every session of
+    /// the project — only the latest session's copy feeds L).
+    report_open_desired: Vec<String>,
 }
 
 /// Last path component of a cwd (the human project name). Mirrors
@@ -95,6 +110,77 @@ fn norm_short_name(raw: Option<String>) -> Option<String> {
     raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Parse a JSON array-of-strings column; null/invalid → empty.
+fn parse_str_array(raw: Option<String>) -> Vec<String> {
+    raw.as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default()
+}
+
+/// Distinct open-loop strings for ranking/UI: digest loops + open dvr desired,
+/// case-insensitive dedupe, order preserved (digest first).
+fn merge_open_loops(digest: &[String], report_desired: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for s in digest.iter().chain(report_desired.iter()) {
+        let t = s.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let key = t.to_lowercase();
+        if seen.insert(key) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Open desired strings from the newest project_reports row per project_key.
+fn load_open_desired_by_project(conn: &rusqlite::Connection) -> HashMap<String, Vec<String>> {
+    #[derive(Deserialize)]
+    struct DvrRow {
+        desired: String,
+        status: String,
+    }
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    // Newest report per key: order by generated_at desc; first write wins per key.
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT project_key, desired_vs_real FROM project_reports
+         ORDER BY generated_at DESC NULLS LAST",
+    ) else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+        ))
+    }) else {
+        return map;
+    };
+    for row in rows.flatten() {
+        let (key, raw) = row;
+        if map.contains_key(&key) {
+            continue; // already have newer report for this key
+        }
+        let opens: Vec<String> = raw
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<DvrRow>>(s).ok())
+            .map(|rows| {
+                rows.into_iter()
+                    .filter(|r| r.status == "open")
+                    .map(|r| r.desired)
+                    .filter(|d| !d.trim().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !opens.is_empty() {
+            map.insert(key, opens);
+        }
+    }
+    map
+}
+
 // ─── DB loading (the only impure helpers) ────────────────────────────────────
 
 /// Same dual blacklist check the indexer / list_sessions / digest apply. Kept
@@ -107,8 +193,8 @@ fn dir_blacklisted(cwd: &str, project_dir: &str, patterns: &[String]) -> bool {
 }
 
 /// Load every non-blacklisted indexed session, projected for the ranker. One
-/// query: the final recap, pinned flag, tag fields, and an open-todo count all
-/// arrive as correlated subqueries (cheap against a ~700-row corpus).
+/// query: the final recap, pinned flag, tag fields, open-todo count, and digest
+/// fields all arrive as correlated subqueries (cheap against a ~700-row corpus).
 pub fn load_session_rows(conn: &rusqlite::Connection) -> Result<Vec<SessionRow>, String> {
     let mut stmt = conn
         .prepare(
@@ -121,7 +207,10 @@ pub fn load_session_rows(conn: &rusqlite::Connection) -> Result<Vec<SessionRow>,
                     (SELECT last_modified FROM projects p WHERE p.encoded_dir = s.project_dir),
                     s.area_of_life, s.project_short_name, s.goal_completed, s.completion_pct,
                     s.kanban_status,
-                    (SELECT COUNT(*) FROM todos t WHERE t.session_id = s.id AND t.status != 'completed')
+                    (SELECT COUNT(*) FROM todos t WHERE t.session_id = s.id AND t.status != 'completed'),
+                    (SELECT open_loops FROM session_digests d WHERE d.session_id = s.id),
+                    (SELECT worked_on FROM session_digests d WHERE d.session_id = s.id),
+                    (SELECT outcome FROM session_digests d WHERE d.session_id = s.id)
              FROM sessions s",
         )
         .map_err(|e| e.to_string())?;
@@ -155,6 +244,16 @@ pub fn load_session_rows(conn: &rusqlite::Connection) -> Result<Vec<SessionRow>,
                 completion_pct: r.get(16)?,
                 kanban_status: r.get(17)?,
                 open_todo_count: r.get(18)?,
+                digest_open_loops: parse_str_array(r.get(19)?),
+                digest_worked_on: r
+                    .get::<_, Option<String>>(20)?
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                digest_outcome: r
+                    .get::<_, Option<String>>(21)?
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                report_open_desired: Vec::new(), // filled below
             })
         })
         .map_err(|e| e.to_string())?
@@ -166,11 +265,17 @@ pub fn load_session_rows(conn: &rusqlite::Connection) -> Result<Vec<SessionRow>,
     // projects are hidden from Home threads + counts by the same post-filter.
     let patterns = crate::db::load_blacklist_patterns(conn);
     let archived = crate::db::load_archived_project_dirs(conn);
+    let open_by_key = load_open_desired_by_project(conn);
     let out = rows
         .into_iter()
         .filter(|r| !dir_blacklisted(&r.cwd, &r.project_dir, &patterns))
         .filter(|r| r.project_status.as_deref() != Some("archived"))
         .filter(|r| !archived.contains(&r.project_dir))
+        .map(|mut r| {
+            let key = crate::ontology::derive_identity_with(&r.cwd, None).key;
+            r.report_open_desired = open_by_key.get(&key).cloned().unwrap_or_default();
+            r
+        })
         .collect();
     Ok(out)
 }
@@ -332,6 +437,10 @@ struct Metrics {
     d: f64,
     u: i64,
     p: i64,
+    /// Open-loop pressure 0..1 (min(count,4)/4).
+    l: f64,
+    /// Distinct open-loop count used for L (for why-copy).
+    open_loop_count: i64,
     s: i64,
     active_days: i64,
     score: f64,
@@ -399,21 +508,33 @@ fn compute_metrics(
     let u = if latest_unfinished(&rows[latest_idx]) { 1 } else { 0 };
     let p = if sessions.iter().any(|&i| rows[i].pinned) { 1 } else { 0 };
 
+    let latest = &rows[latest_idx];
+    let loops = merge_open_loops(&latest.digest_open_loops, &latest.report_open_desired);
+    let open_loop_count = loops.len() as i64;
+    let l = (open_loop_count.min(4) as f64) / 4.0;
+
     // Substance guard: kill drive-by one-offs (single short session, nothing left
-    // open). Everything else clears the bar.
-    let s = if sessions.len() == 1 && rows[latest_idx].message_count < 10 && u == 0 {
+    // open). Everything else clears the bar. Open loops count as substance.
+    let s = if sessions.len() == 1
+        && rows[latest_idx].message_count < 10
+        && u == 0
+        && open_loop_count == 0
+    {
         0
     } else {
         1
     };
 
-    let score = s as f64 * (100.0 * r + 40.0 * d + 30.0 * u as f64 + 15.0 * p as f64);
+    let score =
+        s as f64 * (100.0 * r + 40.0 * d + 30.0 * u as f64 + 15.0 * p as f64 + 25.0 * l);
 
     Metrics {
         r,
         d,
         u,
         p,
+        l,
+        open_loop_count,
         s,
         active_days,
         score,
@@ -430,6 +551,7 @@ enum Comp {
     D,
     U,
     P,
+    L,
 }
 
 /// Humanize a relative time, e.g. "2 hours ago", "yesterday", "just now".
@@ -487,6 +609,13 @@ fn fragment_for(comp: Comp, m: &Metrics, latest: &SessionRow, now: DateTime<Utc>
         Comp::D => format!("Active {} of the last 14 days.", m.active_days),
         Comp::U => unfinished_fragment(latest),
         Comp::P => "Pinned.".to_string(),
+        Comp::L => {
+            let n = m.open_loop_count;
+            format!(
+                "{n} open loop{}.",
+                if n == 1 { "" } else { "s" }
+            )
+        }
     }
 }
 
@@ -511,6 +640,7 @@ fn why_sentence(m: &Metrics, latest: &SessionRow, now: DateTime<Utc>, relaxed: b
         (100.0 * m.r, Comp::R),
         (40.0 * m.d, Comp::D),
         (30.0 * m.u as f64, Comp::U),
+        (25.0 * m.l, Comp::L),
         (15.0 * m.p as f64, Comp::P),
     ];
     let mut chosen: Vec<(f64, Comp)> = weighted.iter().copied().filter(|(v, _)| *v > 0.0).collect();
@@ -577,6 +707,9 @@ fn finalize_thread(
     let m = compute_metrics(&cluster.sessions, rows, now, ref_dt);
     let latest = &rows[m.latest_idx];
     let score = if relaxed { 100.0 * m.r } else { m.score };
+    let mut open_loops =
+        merge_open_loops(&latest.digest_open_loops, &latest.report_open_desired);
+    open_loops.truncate(3);
     HomeThread {
         key: cluster.key.clone(),
         display_name: display_name(cluster, rows),
@@ -589,6 +722,9 @@ fn finalize_thread(
         latest_title: latest.title.clone(),
         latest_recap: latest.recap.clone(),
         open_todos: Vec::new(), // filled by the command for winners
+        open_loops,
+        worked_on: latest.digest_worked_on.clone(),
+        outcome: latest.digest_outcome.clone(),
         completion_pct: latest.completion_pct,
         why_sentence: why_sentence(&m, latest, now, relaxed),
         score,
@@ -725,7 +861,23 @@ mod tests {
             completion_pct: None,
             kanban_status: None,
             open_todo_count: 0,
+            digest_open_loops: Vec::new(),
+            digest_worked_on: None,
+            digest_outcome: None,
+            report_open_desired: Vec::new(),
         }
+    }
+
+    fn row_with_loops(
+        id: &str,
+        cwd: &str,
+        days_ago: f64,
+        now: DateTime<Utc>,
+        loops: &[&str],
+    ) -> SessionRow {
+        let mut r = row(id, cwd, None, None, days_ago, now, 20);
+        r.digest_open_loops = loops.iter().map(|s| s.to_string()).collect();
+        r
     }
 
     fn now_fixed() -> DateTime<Utc> {
@@ -947,6 +1099,8 @@ mod tests {
             d,
             u,
             p,
+            l: 0.0,
+            open_loop_count: 0,
             s: 1,
             active_days,
             score: 0.0,
@@ -1085,5 +1239,73 @@ mod tests {
         assert_eq!(data.total_sessions, 3);
         assert_eq!(data.active_threads_this_week, 2, "app + brain within 7 days");
         assert!(!data.stale, "global max (app, today) is recent");
+    }
+
+    // ─── L term (open loops) ─────────────────────────────────────────────────
+
+    #[test]
+    fn open_loops_raise_rank_over_equal_peer() {
+        let now = now_fixed();
+        // Same recency/density; only loops differ.
+        let with = row_with_loops("a", "/x/alpha", 0.0, now, &["wire e2e", "fix CI"]);
+        let without = row("b", "/x/beta", None, None, 0.0, now, 20);
+        let data = build_home(vec![without, with], now, 5);
+        assert_eq!(data.threads[0].key, "alpha", "open loops should win hero slot");
+        assert!(data.threads[0].score > data.threads[1].score);
+    }
+
+    #[test]
+    fn open_loops_on_thread_capped_at_three() {
+        let now = now_fixed();
+        let r = row_with_loops(
+            "a",
+            "/x/app",
+            0.0,
+            now,
+            &["one", "two", "three", "four", "five"],
+        );
+        let data = build_home(vec![r], now, 5);
+        assert_eq!(data.threads[0].open_loops.len(), 3);
+        assert_eq!(
+            data.threads[0].open_loops,
+            vec!["one".to_string(), "two".to_string(), "three".to_string()]
+        );
+    }
+
+    #[test]
+    fn score_includes_25l_term() {
+        let now = now_fixed();
+        // Four distinct loops → L = 1.0 → +25 vs an identical peer with no loops.
+        let with = row_with_loops("a", "/x/app", 0.0, now, &["a", "b", "c", "d"]);
+        let without = row("b", "/x/app2", None, None, 0.0, now, 20);
+        let m_with = compute_metrics(&[0], &[with], now, now);
+        let m_without = compute_metrics(&[0], &[without], now, now);
+        assert!((m_with.l - 1.0).abs() < 1e-9);
+        assert_eq!(m_with.open_loop_count, 4);
+        assert!((m_without.l).abs() < 1e-9);
+        let delta = m_with.score - m_without.score;
+        assert!(
+            (delta - 25.0).abs() < 0.01,
+            "L term should add exactly 25; delta was {delta}"
+        );
+    }
+
+    #[test]
+    fn merge_open_loops_dedupes_case_insensitively() {
+        let merged = merge_open_loops(
+            &["Wire E2E".into(), "fix CI".into()],
+            &["wire e2e".into(), "Land PR".into()],
+        );
+        assert_eq!(merged, vec!["Wire E2E", "fix CI", "Land PR"]);
+    }
+
+    #[test]
+    fn why_includes_open_loops_when_l_dominates() {
+        let now = now_fixed();
+        let latest = row_with_loops("a", "/x/app", 30.0, now, &["x", "y"]);
+        let mut m = metrics(0.0, 0.0, 0, 0, 0);
+        m.l = 0.5;
+        m.open_loop_count = 2;
+        assert_eq!(why_sentence(&m, &latest, now, false), "2 open loops.");
     }
 }
